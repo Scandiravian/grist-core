@@ -261,9 +261,11 @@ with tempfile.TemporaryDirectory() as root:  # pylint: disable=no-member
         command = make_command(root, ["restore", "--image-path=" + args.restore])
       else:
         command = make_command(root, ["run"])
-      result = subprocess.run(command, cwd=root)  # pylint: disable=no-member
+      result = subprocess.run(command, cwd=root, capture_output=True)  # pylint: disable=no-member
       if result.returncode != 0:
-        raise Exception('gvisor runsc problem: ' + json.dumps(command))
+        stdout = result.stdout.decode("utf-8")
+        stderr = result.stderr.decode("utf-8")
+        raise Exception('gvisor runsc problem: ' + json.dumps(command) + '\nstdout: ' + stdout + '\nstderr: ' + stderr)
     else:
       # We've been asked to make a checkpoint.
       # Start up the sandbox, and wait for it to emit a message on stderr ('Ready').
