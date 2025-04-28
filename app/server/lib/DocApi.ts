@@ -43,11 +43,22 @@ import {
   TableOperationsImpl,
   TableOperationsPlatform
 } from 'app/plugin/TableOperationsImpl';
-import {ActiveDoc, colIdToRef as colIdToReference, getRealTableId, tableIdToRef} from "app/server/lib/ActiveDoc";
+import {
+  ActiveDoc,
+  ArchiveUploadResult,
+  colIdToRef as colIdToReference,
+  getRealTableId,
+  tableIdToRef
+} from "app/server/lib/ActiveDoc";
 import {appSettings} from "app/server/lib/AppSettings";
+import {CreatableArchiveFormats} from 'app/server/lib/Archive';
 import {sendForCompletion} from 'app/server/lib/Assistance';
 import {getDocPoolIdFromDocInfo} from 'app/server/lib/AttachmentStore';
-import {IAttachmentStoreProvider} from 'app/server/lib/AttachmentStoreProvider';
+import {
+  getConfiguredAttachmentStoreConfigs,
+  getConfiguredStandardAttachmentStore,
+  IAttachmentStoreProvider
+} from 'app/server/lib/AttachmentStoreProvider';
 import {
   assertAccess,
   getAuthorizedUserId,
@@ -88,14 +99,16 @@ import {
   optStringParam,
   sendOkReply,
   sendReply,
-  stringParam
+  stringParam,
 } from 'app/server/lib/requestUtils';
 import {ServerColumnGetters} from 'app/server/lib/ServerColumnGetters';
 import {localeFromRequest} from "app/server/lib/ServerLocale";
 import {getDocSessionShare} from "app/server/lib/sessionUtils";
 import {isUrlAllowed, WebhookAction, WebHookSecret} from "app/server/lib/Triggers";
-import {fetchDoc, globalUploadSet, handleOptionalUpload, handleUpload,
-        makeAccessId} from "app/server/lib/uploads";
+import {
+  fetchDoc, globalUploadSet, handleOptionalUpload, handleUpload,
+  makeAccessId, parseMultipartFormRequest,
+} from "app/server/lib/uploads";
 import * as assert from 'assert';
 import contentDisposition from 'content-disposition';
 import {Application, NextFunction, Request, RequestHandler, Response} from "express";
@@ -103,6 +116,7 @@ import * as _ from "lodash";
 import LRUCache from 'lru-cache';
 import * as moment from 'moment';
 import fetch from 'node-fetch';
+import * as stream from 'node:stream';
 import * as path from 'path';
 import * as t from "ts-interface-checker";
 import {Checker} from "ts-interface-checker";
@@ -137,6 +151,7 @@ const {
   ColumnsPost, ColumnsPatch, ColumnsPut,
   SqlPost,
   TablesPost, TablesPatch,
+  SetAttachmentStorePost,
 } = t.createCheckers(DocApiTypesTI, GristDataTI);
 
 for (const checker of [RecordsPatch, RecordsPost, RecordsPut, ColumnsPost, ColumnsPatch,
@@ -515,6 +530,121 @@ export class DocWorkerApi {
         fields: cleanAttachmentRecord(r.fields as MetaRowRecord<"_grist_Attachments">),
       }));
       res.json({records});
+    }));
+
+    // Starts transferring all attachments to the named store, if it exists.
+    this._app.post('/api/docs/:docId/attachments/transferAll', isOwner, withDoc(async (activeDoc, req, res) => {
+      await activeDoc.startTransferringAllAttachmentsToDefaultStore();
+      // Respond with the current status to allow for immediate UI updates.
+      res.json(await activeDoc.attachmentTransferStatus());
+    }));
+
+    // Returns the status of any current / pending attachment transfers
+    this._app.get('/api/docs/:docId/attachments/transferStatus', canView, withDoc(async (activeDoc, req, res) => {
+      res.json(await activeDoc.attachmentTransferStatus());
+    }));
+
+    this._app.get('/api/docs/:docId/attachments/store', canView,
+      withDoc(async (activeDoc, req, res) => {
+        const storeId = await activeDoc.getAttachmentStore();
+        res.json({
+          type: storeId ? 'external' : 'internal',
+        });
+      })
+    );
+
+    this._app.post('/api/docs/:docId/attachments/store', isOwner, validate(SetAttachmentStorePost),
+      withDoc(async (activeDoc, req, res) => {
+        const body = req.body as Types.SetAttachmentStorePost;
+        if (body.type === 'internal') {
+          await activeDoc.setAttachmentStoreFromLabel(docSessionFromRequest(req), undefined);
+        }
+
+        if (body.type === 'external') {
+          const storeLabel = getConfiguredStandardAttachmentStore();
+          if (storeLabel === undefined) {
+            throw new ApiError("server is not configured with an external store", 400);
+          }
+          // This store might not exist - that's acceptable, and should be handled elsewhere.
+          await activeDoc.setAttachmentStoreFromLabel(docSessionFromRequest(req), storeLabel);
+        }
+
+        res.json({
+          store: await activeDoc.getAttachmentStore()
+        });
+      })
+    );
+
+    this._app.get('/api/docs/:docId/attachments/stores', isOwner,
+      withDoc(async (activeDoc, req, res) => {
+        const configs = await getConfiguredAttachmentStoreConfigs();
+        const labels: Types.AttachmentStoreDesc[] = configs.map(c => ({label: c.label}));
+        res.json({stores: labels});
+      })
+    );
+
+    // Responds with an archive of all attachment contents, with suitable Content-Type and Content-Disposition.
+    this._app.get('/api/docs/:docId/attachments/archive', canView, withDoc(async (activeDoc, req, res) => {
+      const archiveFormatStr = optStringParam(req.query.format, 'format', {
+        allowed: CreatableArchiveFormats.values,
+        allowEmpty: true,
+      });
+
+      const archiveFormat = CreatableArchiveFormats.parse(archiveFormatStr) || 'zip';
+      const archive = await activeDoc.getAttachmentsArchive(docSessionFromRequest(req), archiveFormat);
+      const docName = await this._getDownloadFilename(req, "Attachments", activeDoc.doc);
+      res.status(200)
+        .type(archive.mimeType)
+        // Construct a content-disposition header of the form 'attachment; filename="NAME"'
+        .set('Content-Disposition',
+          contentDisposition(`${docName}.${archive.fileExtension}`, {type: 'attachment'}))
+        // Avoid storing because this could be huge.
+        .set('Cache-Control', 'no-store');
+
+      try {
+        await archive.packInto(res, { endDestStream: false });
+      } catch(err) {
+        // Most behaviours here result in a poor user experience. The options are:
+        // - No data written to the stream: open a new tab with a 500 error.
+        // - Destroy the stream: open a new tab with a connection reset error.
+        // - Return some data without res.destroy(): download shows as successful, despite being corrupt.
+        // Sending headers then resetting the connection shows as 'Download failed', which is preferable.
+        // There's no way to guarantee headers have been flushed except by writing data, which is
+        // why we write some arbitrary data then destroy the stream.
+
+        // Need to cast { end: false } to any because @types/node for node 18 has a missing parameter.
+        await stream.promises.pipeline(stream.Readable.from("Internal server error"), res, { end: false } as any);
+        res.destroy(err);
+      }
+      res.end();
+    }));
+
+    this._app.post('/api/docs/:docId/attachments/archive', isOwner, withDoc(async (activeDoc, req, res) => {
+      let archivePromise: Promise<ArchiveUploadResult> | undefined;
+
+      await parseMultipartFormRequest(
+        req,
+        async (file) => {
+          if (archivePromise || !file.name.endsWith('.tar') || file.contentType !== "application/x-tar") { return; }
+          archivePromise = activeDoc.addMissingFilesFromArchive(docSessionFromRequest(req), file.stream);
+          await archivePromise;
+        }
+      );
+
+      if (!archivePromise) {
+        throw new ApiError("No .tar file found in request", 400);
+      }
+
+      // parseMultipartFormRequest ignores handler errors.
+      // Await this here to ensure errors are thrown.
+      try {
+        res.json(await archivePromise);
+      } catch(err) {
+        if (err instanceof Error && err.message === "Unexpected end of data") {
+          throw new Error("File is not a valid .tar");
+        }
+        throw err;
+      }
     }));
 
     // Returns cleaned metadata for a given attachment ID (i.e. a rowId in _grist_Attachments table).
@@ -898,7 +1028,8 @@ export class DocWorkerApi {
     );
 
     /**
-     @deprecated please call to POST /webhooks instead, this endpoint is only for sake of backward compatibility
+     @deprecated please call to POST /webhooks instead, this endpoint is only for sake of backward
+        compatibility
      */
     this._app.post('/api/docs/:docId/tables/:tableId/_subscribe', isOwner, validate(WebhookSubscribe),
       withDocTriggersLock(async (activeDoc, req, res) => {
@@ -923,7 +1054,8 @@ export class DocWorkerApi {
     );
 
     /**
-     @deprecated please call to DEL /webhooks instead, this endpoint is only for sake of backward compatibility
+     @deprecated please call to DEL /webhooks instead, this endpoint is only for sake of backward
+        compatibility
      */
     this._app.post('/api/docs/:docId/tables/:tableId/_unsubscribe', canEdit,
       withDocTriggersLock(removeWebhook)
@@ -1188,6 +1320,10 @@ export class DocWorkerApi {
 
     this._app.get('/api/docs/:docId/compare/:docId2', canView, withDoc(async (activeDoc, req, res) => {
       const showDetails = isAffirmative(req.query.detail);
+      const maxRows = optIntegerParam(req.query.maxRows, "maxRows", {
+        nullable: true,
+        isValid: (n) => n > 0,
+      });
       const docSession = docSessionFromRequest(req);
       const {states} = await this._getStates(docSession, activeDoc);
       const ref = await fetch(this._grist.getHomeInternalUrl(`/api/docs/${req.params.docId2}/states`), {
@@ -1218,11 +1354,20 @@ export class DocWorkerApi {
       };
       if (showDetails && parent) {
         // Calculate changes from the parent to the current version of this document.
-        const leftChanges = (await this._getChanges(docSession, activeDoc, states, parent.h,
-                                                    'HEAD')).details!.rightChanges;
+        const leftChanges = (
+          await this._getChanges(activeDoc, {
+            states,
+            leftHash: parent.h,
+            rightHash: "HEAD",
+            maxRows,
+          })
+        ).details!.rightChanges;
 
         // Calculate changes from the (common) parent to the current version of the other document.
-        const url = `/api/docs/${req.params.docId2}/compare?left=${parent.h}`;
+        let url = `/api/docs/${req.params.docId2}/compare?left=${parent.h}`;
+        if (maxRows !== undefined) {
+          url += `&maxRows=${maxRows}`;
+        }
         const rightChangesReq = await fetch(this._grist.getHomeInternalUrl(url), {
           headers: {
             ...getTransitiveHeaders(req, { includeOrigin: false }),
@@ -1240,38 +1385,57 @@ export class DocWorkerApi {
     // Give details about what changed between two versions of a document.
     this._app.get('/api/docs/:docId/compare', canView, withDoc(async (activeDoc, req, res) => {
       // This could be a relatively slow operation if actions are large.
-      const left = stringParam(req.query.left || 'HEAD', 'left');
-      const right = stringParam(req.query.right || 'HEAD', 'right');
+      const leftHash = stringParam(req.query.left || 'HEAD', 'left');
+      const rightHash = stringParam(req.query.right || 'HEAD', 'right');
+      const maxRows = optIntegerParam(req.query.maxRows, "maxRows", {
+        nullable: true,
+        isValid: (n) => n > 0,
+      });
       const docSession = docSessionFromRequest(req);
       const {states} = await this._getStates(docSession, activeDoc);
-      res.json(await this._getChanges(docSession, activeDoc, states, left, right));
+      res.json(
+        await this._getChanges(activeDoc, {
+          states,
+          leftHash,
+          rightHash,
+          maxRows,
+        })
+      );
     }));
 
     // Do an import targeted at a specific workspace. Although the URL fits ApiServer, this
-    // endpoint is handled only by DocWorker, so is handled here. (Note: this does not handle
-    // actual file uploads, so no worries here about large request bodies.)
+    // endpoint is handled only by DocWorker, so is handled here.
+    // This endpoint either uploads a new file to import, or accepts an existing uploadId.
     this._app.post('/api/workspaces/:wid/import', expressWrap(async (req, res) => {
       const mreq = req as RequestWithLogin;
       const userId = getUserId(req);
       const wsId = integerParam(req.params.wid, 'wid');
-      const uploadId = integerParam(req.body.uploadId, 'uploadId');
-      const result = await this._docManager.importDocToWorkspace(mreq, {
+
+      let params: { [key: string]: any } = {};
+      if (req.is('multipart/form-data')) {
+        const formResult = await handleOptionalUpload(req, res);
+        params = formResult.parameters ?? {};
+        if (formResult.upload) {
+          params.uploadId = formResult.upload.uploadId;
+        }
+      } else {
+        params = req.body;
+      }
+
+      const uploadId = integerParam(params.uploadId, 'uploadId');
+
+      const browserSettings = params.browserSettings ?? {
+        timezone: params.timezone,
+        locale: localeFromRequest(req),
+      };
+
+      const result = await this._importDocumentToWorkspace(mreq, {
         userId,
         uploadId,
         workspaceId: wsId,
-        browserSettings: req.body.browserSettings,
-        telemetryMetadata: {
-          limited: {
-            isImport: true,
-            sourceDocIdDigest: undefined,
-          },
-          full: {
-            userId: mreq.userId,
-            altSessionId: mreq.altSessionId,
-          },
-        },
+        documentName: optStringParam(params.documentName, 'documentName'),
+        browserSettings,
       });
-      this._logImportDocumentEvents(mreq, result);
       res.json(result);
     }));
 
@@ -1398,22 +1562,12 @@ export class DocWorkerApi {
           asTemplate: optBooleanParam(parameters.asTemplate, 'asTemplate'),
         });
       } else if (uploadId !== undefined) {
-        const result = await this._docManager.importDocToWorkspace(mreq, {
+        const result = await this._importDocumentToWorkspace(mreq, {
           userId,
           uploadId,
           documentName: optStringParam(parameters.documentName, 'documentName'),
           workspaceId,
-          browserSettings,
-          telemetryMetadata: {
-            limited: {
-              isImport: true,
-              sourceDocIdDigest: undefined,
-            },
-            full: {
-              userId: mreq.userId,
-              altSessionId: mreq.altSessionId,
-            },
-          },
+          browserSettings
         });
         docId = result.id;
         this._logImportDocumentEvents(mreq, result);
@@ -1428,6 +1582,22 @@ export class DocWorkerApi {
           browserSettings,
         });
       }
+
+      return res.status(200).json(docId);
+    }));
+
+    this._app.post('/api/docs/:docId/copy', canView, expressWrap(async (req, res) => {
+      const userId = getUserId(req);
+
+      const parameters: {[key: string]: any} = req.body;
+
+      const docId = await this._copyDocToWorkspace(req, {
+        userId,
+        sourceDocumentId: stringParam(req.params.docId, 'docId'),
+        workspaceId: integerParam(parameters.workspaceId, 'workspaceId'),
+        documentName: stringParam(parameters.documentName, 'documentName'),
+        asTemplate: optBooleanParam(parameters.asTemplate, 'asTemplate'),
+      });
 
       return res.status(200).json(docId);
     }));
@@ -1696,6 +1866,34 @@ export class DocWorkerApi {
     return id;
   }
 
+  private async _importDocumentToWorkspace(mreq: RequestWithLogin, options: {
+    userId: number,
+    uploadId: number,
+    documentName?: string,
+    workspaceId?: number,
+    browserSettings?: BrowserSettings,
+  }) {
+    const result = await this._docManager.importDocToWorkspace(mreq, {
+      userId: options.userId,
+      uploadId: options.uploadId,
+      documentName: options.documentName,
+      workspaceId: options.workspaceId,
+      browserSettings: options.browserSettings,
+      telemetryMetadata: {
+        limited: {
+          isImport: true,
+          sourceDocIdDigest: undefined,
+        },
+        full: {
+          userId: mreq.userId,
+          altSessionId: mreq.altSessionId,
+        },
+      },
+    });
+    this._logImportDocumentEvents(mreq, result);
+    return result;
+  }
+
   private async _createNewSavedDoc(req: Request, options: {
     workspaceId: number,
     documentName?: string,
@@ -1887,7 +2085,8 @@ export class DocWorkerApi {
   }
 
   /**
-   * Creates a middleware that checks the current usage of a limit and rejects the request if it is exceeded.
+   * Creates a middleware that checks the current usage of a limit and rejects the request if it is
+   * exceeded.
    */
   private async _checkLimit(limit: LimitType, req: Request, res: Response, next: NextFunction) {
     await this._dbManager.increaseUsage(getDocScope(req), limit, {dryRun: true, delta: 1});
@@ -1923,8 +2122,8 @@ export class DocWorkerApi {
 
   /**
    * Check if user is an owner of the document.
-   * If acceptTrunkForSnapshot is set, being an owner of the trunk of the document (if it is a snapshot)
-   * is sufficient. Uses cachedDoc, which could be stale if access has changed recently.
+   * If acceptTrunkForSnapshot is set, being an owner of the trunk of the document (if it is a
+   * snapshot) is sufficient. Uses cachedDoc, which could be stale if access has changed recently.
    */
   private async _isOwner(req: Request, options?: { acceptTrunkForSnapshot?: boolean }) {
     const scope = getDocScope(req);
@@ -1984,8 +2183,16 @@ export class DocWorkerApi {
    * be lifted, but is adequate for now).
    *
    */
-  private async _getChanges(docSession: OptDocSession, activeDoc: ActiveDoc, states: DocState[],
-                            leftHash: string, rightHash: string): Promise<DocStateComparison> {
+  private async _getChanges(
+    activeDoc: ActiveDoc,
+    options: {
+      states: DocState[];
+      leftHash: string;
+      rightHash: string;
+      maxRows?: number | null;
+    }
+  ): Promise<DocStateComparison> {
+    const { states, leftHash, rightHash, maxRows } = options;
     const finder = new HashUtil(states);
     const leftOffset = finder.hashToOffset(leftHash);
     const rightOffset = finder.hashToOffset(rightHash);
@@ -1997,7 +2204,9 @@ export class DocWorkerApi {
     let totalAction = createEmptyActionSummary();
     for (const action of actions) {
       if (!action) { continue; }
-      const summary = summarizeAction(action);
+      const summary = summarizeAction(action, {
+        maximumInlineRows: maxRows,
+      });
       totalAction = concatenateSummaries([totalAction, summary]);
     }
     const result: DocStateComparison = {
@@ -2597,12 +2806,15 @@ export function docPeriodicApiUsageKey(docId: string, current: boolean, period: 
  * Maintain up to 5 buckets: current day, next day, current hour, next hour, current minute.
  * For each API request, check in order:
  * - if current_day < DAILY_LIMIT, allow; increment all 3 current buckets
- * - else if current_hour < DAILY_LIMIT/24, allow; increment next_day, current_hour, and current_minute buckets.
- * - else if current_minute < DAILY_LIMIT/24/60, allow; increment next_day, next_hour, and current_minute buckets.
+ * - else if current_hour < DAILY_LIMIT/24, allow; increment next_day, current_hour, and
+ * current_minute buckets.
+ * - else if current_minute < DAILY_LIMIT/24/60, allow; increment next_day, next_hour, and
+ * current_minute buckets.
  * - else reject.
  * I think it has pretty good properties:
  * - steady low usage may be maintained even if a burst exhausted the daily limit
- * - user could get close to twice the daily limit on the first day with steady usage after a burst,
+ * - user could get close to twice the daily limit on the first day with steady usage after a
+ * burst,
  *   but would then be limited to steady usage the next day.
  */
 export function getDocApiUsageKeysToIncr(

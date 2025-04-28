@@ -8,6 +8,7 @@ import {aclSelect} from 'app/client/aclui/ACLSelect';
 import {ACLUsersPopup} from 'app/client/aclui/ACLUsers';
 import {permissionsWidget} from 'app/client/aclui/PermissionsWidget';
 import {GristDoc} from 'app/client/components/GristDoc';
+import {ISuggestionWithSubAttrs} from 'app/client/lib/Suggestions';
 import {logTelemetryEvent} from 'app/client/lib/telemetry';
 import {reportError, UserError} from 'app/client/models/errors';
 import {TableData} from 'app/client/models/TableData';
@@ -40,9 +41,15 @@ import {
   RuleSet,
   UserAttributeRule
 } from 'app/common/GranularAccessClause';
-import {isHiddenCol} from 'app/common/gristTypes';
+import {getDefaultForType, isHiddenCol} from 'app/common/gristTypes';
 import {isNonNullish, unwrap} from 'app/common/gutil';
-import {getPredicateFormulaProperties, PredicateFormulaProperties} from 'app/common/PredicateFormula';
+import {EmptyRecordView, InfoView, RecordView} from 'app/common/RecordView';
+import {
+  getPredicateFormulaProperties,
+  ParsedPredicateFormula,
+  PredicateFormulaProperties,
+  typeCheckFormula,
+} from 'app/common/PredicateFormula';
 import {SchemaTypes} from 'app/common/schema';
 import {MetaRowRecord} from 'app/common/TableData';
 import {
@@ -80,11 +87,34 @@ enum RuleStatus {
   CheckPending,
 }
 
+interface ISuggestionInfo {
+  gristType?: string;     // If given, enables attributes using autoCompleteTypeAttributes().
+  example?: string;       // Optional example value to show with suggestions.
+}
+
 // UserAttribute autocomplete choices. RuleIndex is used to filter for only those user
 // attributes made available by the previous rules.
-interface IAttrOption {
+interface IAttrOption extends ISuggestionInfo {
   ruleIndex: number;
   value: string;
+}
+
+interface IColTypeInfo extends ISuggestionInfo {
+  colId: string;
+}
+
+class Suggestion implements ISuggestionWithSubAttrs {
+  constructor(public value: string, private _info?: ISuggestionInfo) {}
+  public get example() {
+    return (this._info?.gristType || '') + (this._info?.example ? ` (e.g. ${this._info?.example})` : '');
+  }
+
+  public subAttributes(): ISuggestionWithSubAttrs[] {
+    if (this._info?.gristType === 'Text') {
+      return ['upper()', 'lower()'].map(value => ({value}));
+    }
+    return [];
+  }
 }
 
 /**
@@ -118,6 +148,9 @@ export class AccessRules extends Disposable {
 
   // Whether the save button should be enabled.
   private _savingEnabled: Computed<boolean>;
+
+  // Whether a save is currently in progress.
+  private _saving = Observable.create(this, false);
 
   // Error or warning message to show next to Save/Reset buttons if non-empty.
   private _errorMessage = Observable.create(this, '');
@@ -155,22 +188,24 @@ export class AccessRules extends Disposable {
       (s === RuleStatus.ChangedValid));
 
     this._userAttrChoices = Computed.create(this, this._userAttrRules, (use, rules) => {
+      // Types are Grist equivalents of corresponding fields in app/common/User.
+      // Examples are also shown in autocomplete: include only the couple of commonly-used ones.
       const result: IAttrOption[] = [
-        {ruleIndex: -1, value: 'user.Access'},
-        {ruleIndex: -1, value: 'user.Email'},
-        {ruleIndex: -1, value: 'user.UserID'},
-        {ruleIndex: -1, value: 'user.Name'},
+        {ruleIndex: -1, value: 'user.Access',     gristType: 'Choice', example: 'VIEWER'},
+        {ruleIndex: -1, value: 'user.Email',      gristType: 'Text',   example: '"alice@example.com"'},
+        {ruleIndex: -1, value: 'user.UserID',     gristType: 'Int'},
+        {ruleIndex: -1, value: 'user.Name',       gristType: 'Text'},
         {ruleIndex: -1, value: 'user.LinkKey.'},
-        {ruleIndex: -1, value: 'user.Origin'},
-        {ruleIndex: -1, value: 'user.SessionID'},
-        {ruleIndex: -1, value: 'user.IsLoggedIn'},
-        {ruleIndex: -1, value: 'user.UserRef'},
+        {ruleIndex: -1, value: 'user.Origin',     gristType: 'Text'},
+        {ruleIndex: -1, value: 'user.SessionID',  gristType: 'Text'},
+        {ruleIndex: -1, value: 'user.IsLoggedIn', gristType: 'Bool',   example: 'True'},
+        {ruleIndex: -1, value: 'user.UserRef',    gristType: 'Text'},
       ];
       for (const [i, rule] of rules.entries()) {
         const tableId = use(rule.tableId);
         const name = use(rule.name);
-        for (const colId of this.getValidColIds(tableId) || []) {
-          result.push({ruleIndex: i, value: `user.${name}.${colId}`});
+        for (const c of this.getColTypeInfo(tableId)) {
+          result.push({...c, ruleIndex: i, value: `user.${name}.${c.colId}`});
         }
       }
       return result;
@@ -244,116 +279,129 @@ export class AccessRules extends Disposable {
    * Collect the internal state into records and sync them to the document.
    */
   public async save(): Promise<void> {
-    if (!this._savingEnabled.get()) { return; }
-
-    // Note that if anything has changed, we apply changes relative to the current state of the
-    // ACL tables (they may have changed by other users). So our changes will win.
-
-    const docData = this.gristDoc.docData;
-    const resourcesTable = docData.getMetaTable('_grist_ACLResources');
-    const rulesTable = docData.getMetaTable('_grist_ACLRules');
-
-    // Add/remove resources to have just the ones we need.
-    const newResources: MetaRowRecord<'_grist_ACLResources'>[] = flatten(
-      [{tableId: '*', colIds: '*'}],
-      this._specialRulesWithDefault.get()?.getResources() || [],
-      this._specialRulesSeparate.get()?.getResources() || [],
-      ...this._tableRules.get().map(tr => tr.getResources())
-    )
-    // Skip the fake "*SPECIAL:SchemaEdit" resource (frontend-specific); these rules are saved to the default resource.
-    .filter(resource => !isSchemaEditResource(resource))
-    .map(r => ({id: -1, ...r}));
-
-    // Prepare userActions and a mapping of serializedResource to rowIds.
-    const resourceSync = syncRecords(resourcesTable, newResources, serializeResource);
-
-    const defaultResourceRowId = resourceSync.rowIdMap.get(serializeResource({id: -1, tableId: '*', colIds: '*'}));
-    if (!defaultResourceRowId) {
-      throw new Error('Default resource missing in resource map');
+    if (!this._savingEnabled.get() || this._saving.get()) {
+      return;
     }
 
-    // For syncing rules, we'll go by rowId that we store with each RulePart and with the RuleSet.
-    const newRules: RowRecord[] = [];
-    for (const rule of this.getRules()) {
-      // We use id of 0 internally to mark built-in rules. Skip those.
-      if (rule.id === 0) {
-        continue;
-      }
-
-      // Look up the rowId for the resource.
-      let resourceRowId: number|undefined;
-      // Assign the rules for the fake "*SPECIAL:SchemaEdit" resource to the default resource where they belong.
-      if (isSchemaEditResource(rule.resourceRec!)) {
-        resourceRowId = defaultResourceRowId;
-      } else {
-        const resourceKey = serializeResource(rule.resourceRec as RowRecord);
-        resourceRowId = resourceSync.rowIdMap.get(resourceKey);
-        if (!resourceRowId) {
-          throw new Error(`Resource missing in resource map: ${resourceKey}`);
-        }
-      }
-      newRules.push({
-        id: rule.id || -1,
-        resource: resourceRowId,
-        aclFormula: rule.aclFormula!,
-        permissionsText: rule.permissionsText!,
-        rulePos: rule.rulePos || null,
-        memo: rule.memo ?? '',
-      });
-    }
-
-    // UserAttribute rules are listed in the same rulesTable.
-    for (const userAttr of this._userAttrRules.get()) {
-      const rule = userAttr.getRule();
-      newRules.push({
-        id: rule.id || -1,
-        resource: defaultResourceRowId,
-        rulePos: rule.rulePos || null,
-        userAttributes: rule.userAttributes,
-      });
-    }
-
-    logTelemetryEvent('changedAccessRules', {
-      full: {
-        docIdDigest: this.gristDoc.docId(),
-        ruleCount: newRules.length,
-      },
-    });
-
-    // We need to fill in rulePos values. We'll add them in the order the rules are listed (since
-    // this.getRules() returns them in a suitable order), keeping rulePos unchanged when possible.
-    let lastGoodRulePos = 0;
-    let lastGoodIndex = -1;
-    for (let i = 0; i < newRules.length; i++) {
-      const pos = newRules[i].rulePos as number;
-      if (pos && pos > lastGoodRulePos) {
-        const step = (pos - lastGoodRulePos) / (i - lastGoodIndex);
-        for (let k = lastGoodIndex + 1; k < i; k++) {
-          newRules[k].rulePos = lastGoodRulePos + step * (k - lastGoodIndex);
-        }
-        lastGoodRulePos = pos;
-        lastGoodIndex = i;
-      }
-    }
-    // Fill in the rulePos values for the remaining rules.
-    for (let k = lastGoodIndex + 1; k < newRules.length; k++) {
-      newRules[k].rulePos = ++lastGoodRulePos;
-    }
-    // Prepare the UserActions for syncing the Rules table.
-    const rulesSync = syncRecords(rulesTable, newRules);
-
-    // Finally collect and apply all the actions together.
+    this._saving.set(true);
     try {
-      await docData.sendActions([...resourceSync.userActions, ...rulesSync.userActions]);
-    } catch (e) {
-      // Report the error, but go on to update the rules. The user may lose their entries, but
-      // will see what's in the document. To preserve entries and show what's wrong, we try to
-      // catch errors earlier.
-      reportError(e);
-    }
+      // Note that if anything has changed, we apply changes relative to the current state of the
+      // ACL tables (they may have changed by other users). So our changes will win.
 
-    // Re-populate the state from DocData once the records are synced.
-    await this.update();
+      const docData = this.gristDoc.docData;
+      const resourcesTable = docData.getMetaTable('_grist_ACLResources');
+      const rulesTable = docData.getMetaTable('_grist_ACLRules');
+
+      // Add/remove resources to have just the ones we need.
+      const newResources: MetaRowRecord<'_grist_ACLResources'>[] = flatten(
+        [{tableId: '*', colIds: '*'}],
+        this._specialRulesWithDefault.get()?.getResources() || [],
+        this._specialRulesSeparate.get()?.getResources() || [],
+        ...this._tableRules.get().map(tr => tr.getResources())
+      )
+        // Skip the fake "*SPECIAL:SchemaEdit" resource (frontend-specific); these rules are saved to the default
+        // resource.
+        .filter(resource => !isSchemaEditResource(resource))
+        .map(r => ({id: -1, ...r}));
+
+      // Prepare userActions and a mapping of serializedResource to rowIds.
+      const resourceSync = syncRecords(resourcesTable, newResources, serializeResource);
+
+      const defaultResourceRowId = resourceSync.rowIdMap.get(serializeResource({id: -1, tableId: '*', colIds: '*'}));
+      if (!defaultResourceRowId) {
+        throw new Error('Default resource missing in resource map');
+      }
+
+      // For syncing rules, we'll go by rowId that we store with each RulePart and with the RuleSet.
+      const newRules: RowRecord[] = [];
+      for (const rule of this.getRules()) {
+        // We use id of 0 internally to mark built-in rules. Skip those.
+        if (rule.id === 0) {
+          continue;
+        }
+
+        // Look up the rowId for the resource.
+        let resourceRowId: number|undefined;
+        // Assign the rules for the fake "*SPECIAL:SchemaEdit" resource to the default resource where they belong.
+        if (isSchemaEditResource(rule.resourceRec!)) {
+          resourceRowId = defaultResourceRowId;
+        } else {
+          const resourceKey = serializeResource(rule.resourceRec as RowRecord);
+          resourceRowId = resourceSync.rowIdMap.get(resourceKey);
+          if (!resourceRowId) {
+            throw new Error(`Resource missing in resource map: ${resourceKey}`);
+          }
+        }
+        newRules.push({
+          id: rule.id || -1,
+          resource: resourceRowId,
+          aclFormula: rule.aclFormula!,
+          permissionsText: rule.permissionsText!,
+          rulePos: rule.rulePos || null,
+          memo: rule.memo ?? '',
+        });
+      }
+
+      // UserAttribute rules are listed in the same rulesTable.
+      for (const userAttr of this._userAttrRules.get()) {
+        const rule = userAttr.getRule();
+        newRules.push({
+          id: rule.id || -1,
+          resource: defaultResourceRowId,
+          rulePos: rule.rulePos || null,
+          userAttributes: rule.userAttributes,
+        });
+      }
+
+      logTelemetryEvent('changedAccessRules', {
+        full: {
+          docIdDigest: this.gristDoc.docId(),
+          ruleCount: newRules.length,
+        },
+      });
+
+      // We need to fill in rulePos values. We'll add them in the order the rules are listed (since
+      // this.getRules() returns them in a suitable order), keeping rulePos unchanged when possible.
+      let lastGoodRulePos = 0;
+      let lastGoodIndex = -1;
+      for (let i = 0; i < newRules.length; i++) {
+        const pos = newRules[i].rulePos as number;
+        if (pos && pos > lastGoodRulePos) {
+          const step = (pos - lastGoodRulePos) / (i - lastGoodIndex);
+          for (let k = lastGoodIndex + 1; k < i; k++) {
+            newRules[k].rulePos = lastGoodRulePos + step * (k - lastGoodIndex);
+          }
+          lastGoodRulePos = pos;
+          lastGoodIndex = i;
+        }
+      }
+      // Fill in the rulePos values for the remaining rules.
+      for (let k = lastGoodIndex + 1; k < newRules.length; k++) {
+        newRules[k].rulePos = ++lastGoodRulePos;
+      }
+      // Prepare the UserActions for syncing the Rules table.
+      const rulesSync = syncRecords(rulesTable, newRules);
+
+      // Finally collect and apply all the actions together.
+      try {
+        await docData.sendActions([
+          ...resourceSync.userActions,
+          ...rulesSync.userActions
+        ]);
+      } catch (e) {
+        // Report the error, but go on to update the rules. The user may lose their entries, but
+        // will see what's in the document. To preserve entries and show what's wrong, we try to
+        // catch errors earlier.
+        reportError(e);
+      }
+
+      // Re-populate the state from DocData once the records are synced.
+      await this.update();
+    } finally {
+      if (!this.isDisposed()) {
+        this._saving.set(false);
+      }
+    }
   }
 
   public buildDom() {
@@ -370,8 +418,11 @@ export class AccessRules extends Disposable {
           }),
           testId('rules-non-save')
         ),
-        bigPrimaryButton(t("Save"), dom.show(this._savingEnabled),
+        bigPrimaryButton(
+          t("Save"),
+          dom.show(this._savingEnabled),
           dom.on('click', () => this.save()),
+          dom.prop('disabled', this._saving),
           testId('rules-save'),
         ),
         bigBasicButton(t("Reset"), dom.show(use => use(this._ruleStatus) !== RuleStatus.Unchanged),
@@ -522,10 +573,29 @@ export class AccessRules extends Disposable {
     return this._aclResources.get(tableId)?.colIds.filter(id => !isHiddenCol(id)).sort();
   }
 
+  public getColTypeInfo(tableId?: string): IColTypeInfo[] {
+    if (!tableId) { return []; }
+    return getColTypeInfo(this.getValidColIds(tableId) || [], this.gristDoc.docData.getTable(tableId));
+  }
+
+  public typeCheckFormula(formulaParsed: ParsedPredicateFormula, tableId?: string): string|false {
+    const sampleRecord = tableId ? this._getSampleRecord(tableId) : new EmptyRecordView();
+
+    const userAttrSamples: {[key: string]: InfoView} = {};
+    for (const attr of this._userAttrRules.get()) {
+      userAttrSamples[attr.name.get()] = this._getSampleRecord(attr.tableId.get());
+    }
+    return typeCheckFormula(formulaParsed, sampleRecord, userAttrSamples);
+  }
+
   // Get rules to use for seeding any new set of table/column rules, e.g. to give owners
   // broad rights over the table/column contents.
   public getSeedRules(): ObsRulePart[] {
     return this._specialRulesWithDefault.get()?.getCustomRules('SeedRule') || [];
+  }
+
+  private _getSampleRecord(tableId: string): InfoView {
+    return getSampleRecord(this.getValidColIds(tableId) || [], this.gristDoc.docData.getTable(tableId));
   }
 
   private _addTableRules(tableId: string) {
@@ -1069,6 +1139,12 @@ abstract class ObsRuleSet extends Disposable {
     return (tableId && this.accessRules.getValidColIds(tableId)) || [];
   }
 
+  public getColTypeInfo() { return this.accessRules.getColTypeInfo(this._tableRules?.tableId); }
+
+  public typeCheckFormula(formulaParsed: ParsedPredicateFormula) {
+    return this.accessRules.typeCheckFormula(formulaParsed, this._tableRules?.tableId);
+  }
+
   /**
    * Check if this rule set is limited to a set of columns.
    */
@@ -1478,7 +1554,7 @@ class ObsUserAttributeRule extends Disposable {
               readOnly: false,
               setValue: (text) => this._setUserAttr(text),
               placeholder: '',
-              getSuggestions: () => this._userAttrChoices.get().map(choice => choice.value),
+              getSuggestions: () => this._userAttrChoices.get().map(s => new Suggestion(s.value, s)),
               customiseEditor: (editor => {
                 editor.on('focus', () => {
                   if (editor.getValue() == 'user.') {
@@ -1579,12 +1655,15 @@ class ObsRulePart extends Disposable {
   private _aclFormula = Observable.create<string>(this, this._rulePart?.aclFormula || "");
 
   // Rule-specific completions for editing the formula, e.g. "user.Email" or "rec.City".
-  private _completions = Computed.create<string[]>(this, (use) => [
-    ...use(this._ruleSet.accessRules.userAttrChoices).map(opt => opt.value),
-    ...this._ruleSet.getValidColIds().map(colId => `rec.${colId}`),
-    ...this._ruleSet.getValidColIds().map(colId => `$${colId}`),
-    ...this._ruleSet.getValidColIds().map(colId => `newRec.${colId}`),
-  ]);
+  private _completions = Computed.create<ISuggestionWithSubAttrs[]>(this, (use) => {
+    const colInfo = this._ruleSet.getColTypeInfo();
+    return [
+      ...use(this._ruleSet.accessRules.userAttrChoices).map(s => new Suggestion(s.value, s)),
+      ...colInfo.map(c => new Suggestion(`rec.${c.colId}`, c)),
+      ...colInfo.map(c => new Suggestion(`$${c.colId}`, c)),
+      ...colInfo.map(c => new Suggestion(`newRec.${c.colId}`, c)),
+    ];
+  });
 
   // The permission bits.
   private _permissions = Observable.create<PartialPermissionSet>(
@@ -1627,7 +1706,7 @@ class ObsRulePart extends Disposable {
 
     this._error = Computed.create(this, (use) => {
       return use(this._formulaError) ||
-        this._warnInvalidColIds(use(this._formulaProperties).recColIds) ||
+        this._warnInvalidFormula(use(this._formulaProperties)) ||
         ( !this._ruleSet.isLastCondition(use, this) &&
           use(this._aclFormula) === '' &&
           permissionSetToText(use(this._permissions)) !== '' ?
@@ -1717,7 +1796,7 @@ class ObsRulePart extends Disposable {
                 t('Enter Condition')
               );
             }),
-            getSuggestions: (prefix) => this._completions.get(),
+            getSuggestions: () => this._completions.get(),
             customiseEditor: (editor) => { this.focusEditor = () => editor.focus(); },
           }),
           testId('rule-acl-formula'),
@@ -1824,7 +1903,12 @@ class ObsRulePart extends Disposable {
     }
   }
 
-  private _warnInvalidColIds(colIds?: string[]) {
+  private _warnInvalidFormula(formulaProperties: PredicateFormulaProperties): string|false {
+    return this._warnInvalidColIds(formulaProperties.recColIds) ||
+      this._typeCheckFormula(formulaProperties.formulaParsed);
+  }
+
+  private _warnInvalidColIds(colIds?: string[]): string|false {
     if (!colIds || !colIds.length) { return false; }
     const allValid = new Set(this._ruleSet.getValidColIds());
     const specialColumn = this._ruleSet.getSpecialColumn();
@@ -1837,6 +1921,16 @@ class ObsRulePart extends Disposable {
     if (invalid.length > 0) {
       return `Invalid columns: ${invalid.join(', ')}`;
     }
+    return false;
+  }
+
+  private _typeCheckFormula(formulaParsed?: ParsedPredicateFormula): string|false {
+    if (!formulaParsed) { return false; }
+
+    // Don't fail seed rules. Those only get checked for validity once they are used.
+    if (this._ruleSet.getSpecialColumn() === 'SeedRule') { return false; }
+
+    return this._ruleSet.typeCheckFormula(formulaParsed);
   }
 }
 
@@ -1954,6 +2048,47 @@ function filterRuleSet(colIds: string[], ruleSet?: RuleSet): RuleSet|undefined {
 // columns.
 function filterRuleSets(colIds: string[], ruleSets: RuleSet[]): RuleSet[] {
   return ruleSets.map(ruleSet => filterRuleSet(colIds, ruleSet)).filter(rs => rs) as RuleSet[];
+}
+
+function makeSuggestionExample(value: unknown): string|undefined {
+  // Produce a representation of the value similar to Python's repr(), at least in the common case.
+  if (typeof value === "string") {
+    return JSON.stringify(value);     // Make clear that this is a string value
+  } else if (typeof value === "boolean") {
+    return value ? "True" : "False";
+  } else if (value === null) {
+    return "None";
+  } else if (value !== undefined) {
+    return String(value);
+  }
+}
+
+function getColTypeInfo(colIds: string[], tableData?: TableData): IColTypeInfo[] {
+  // Unlike aclResources, data available through docData may be restricted. If we don't know
+  // about a column, we just won't have type-specific autocomplete suggestions for it.
+  return colIds.map(colId => {
+    const gristType = tableData?.getColType(colId);
+    // Note that example values will only be shown when tableData has been loaded, but it doesn't
+    // seem important enough to load data just for this.
+    const example = makeSuggestionExample(tableData?.getColValues(colId)?.[0]);
+    return {colId, gristType, example};
+  });
+}
+
+function getSampleRecord(colIds: string[], tableData?: TableData): InfoView {
+  if (!tableData) { return new EmptyRecordView(); }
+
+  const colValues: BulkColValues = {};
+  for (const colId of colIds) {
+    const gristType = tableData.getColType(colId);
+    const defaultValue = gristType ? getDefaultForType(gristType) : null;
+    // Replace null with false, to avoid producing "No value for X" error (from
+    // app/common/PredicateFormula.ts) for null default values, since that's usually misleading.
+    // This poor-man's type checking is weak... It actually evaluates expressions, but that means
+    // it doesn't check branches not taken.
+    colValues[colId] = defaultValue === null ? [false] : [defaultValue];
+  }
+  return new RecordView(['TableData', tableData.tableId, [1], colValues], 0);
 }
 
 const cssOuter = styled('div', `

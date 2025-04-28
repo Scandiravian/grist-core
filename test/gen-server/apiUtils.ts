@@ -35,10 +35,14 @@ export class TestServer {
   }
 
   public async start(servers: ServerType[] = ["home"],
-                     options: FlexServerOptions = {}): Promise<string> {
-    await createInitialDb();
+                     options: FlexServerOptions = {},
+                     {
+                       seedData = true,
+                       externalStorage = false,
+                     } = {}): Promise<string> {
+    await createInitialDb(undefined, seedData ? true : 'migrateOnly');
     const mergedServer = await MergedServer.create(0, servers, {logToConsole: isAffirmative(process.env.DEBUG),
-                                                      externalStorage: false, ...options});
+                                                      externalStorage, ...options});
     await mergedServer.run();
     this.server = mergedServer.flexServer;
     this.serverUrl = this.server.getOwnUrl();
@@ -55,7 +59,7 @@ export class TestServer {
     // we substitute sqlite for postgres.
     if (this.server.hasNotifier()) {
       for (let i = 0; i < 30; i++) {
-        if (!this.server.getNotifier().testPending) { break; }
+        if (!this.server.testPending) { break; }
         await delay(100);
       }
     }

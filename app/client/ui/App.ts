@@ -23,6 +23,7 @@ import {ISupportedFeatures} from 'app/common/UserConfig';
 import {dom} from 'grainjs';
 import * as ko from 'knockout';
 import {makeT} from 'app/client/lib/localization';
+import { onClickOutside } from 'app/client/lib/domUtils';
 
 const t = makeT('App');
 
@@ -30,10 +31,19 @@ const t = makeT('App');
 
 const G = getBrowserGlobals('document', 'window');
 
+export interface App extends DisposableWithEvents {
+  allCommands: typeof commands.allCommands;
+  comm: Comm;
+  clientScope: ClientScope;
+  features: ko.Computed<ISupportedFeatures>;
+  topAppModel: TopAppModel;
+  pageModel?: DocPageModel;
+}
+
 /**
  * Main Grist App UI component.
  */
-export class App extends DisposableWithEvents {
+export class AppImpl extends DisposableWithEvents implements App {
   // Used by #newui code to avoid a dependency on commands.js, and by tests to issue commands.
   public allCommands = commands.allCommands;
 
@@ -42,14 +52,14 @@ export class App extends DisposableWithEvents {
   public features: ko.Computed<ISupportedFeatures>;
   public topAppModel: TopAppModel;    // Exposed because used by test/nbrowser/gristUtils.
 
+  // Track the most recently created DocPageModel, for some error handling.
+  public pageModel?: DocPageModel;
+
   private _settings: ko.Observable<{features?: ISupportedFeatures}>;
 
   // Track the version of the server we are communicating with, so that if it changes
   // we can choose to refresh the client also.
   private _serverVersion: string|null = null;
-
-  // Track the most recently created DocPageModel, for some error handling.
-  private _mostRecentDocPageModel?: DocPageModel;
 
   constructor() {
     super();
@@ -87,10 +97,10 @@ export class App extends DisposableWithEvents {
 
     G.document.querySelector('#grist-logo-wrapper')?.remove();
 
-    // Help pop-up pane
     const helpDiv = document.body.appendChild(
       dom('div.g-help',
-        dom.show(isHelpPaneVisible),
+        onClickOutside(() => isHelpPaneVisible(false)),
+        dom.show(isHelpPaneVisible), // Toggle visibility dynamically
         dom('table.g-help-table',
           dom('thead',
             dom('tr',
@@ -125,8 +135,9 @@ export class App extends DisposableWithEvents {
       historyForward() { G.window.history.forward(); },
     }, this, true));
 
+    /** Ensure menu closes on cancel */
     this.autoDispose(commands.createGroup({
-      cancel() { isHelpPaneVisible(false); },
+      cancel() { isHelpPaneVisible(false); },   // Close menu when Esc/Cancel is triggered
       cursorDown() { helpDiv.scrollBy(0, 30); }, // 30 is height of the row in the help screen
       cursorUp() { helpDiv.scrollBy(0, -30); },
       pageUp() { helpDiv.scrollBy(0, -helpDiv.clientHeight); },
@@ -134,7 +145,7 @@ export class App extends DisposableWithEvents {
       moveToFirstField() { helpDiv.scrollTo(0, 0); }, // home
       moveToLastField() { helpDiv.scrollTo(0, helpDiv.scrollHeight); }, // end
       find() { return true; }, // restore browser search
-      help() { isHelpPaneVisible(false); },
+      shortcuts() { isHelpPaneVisible(false); },  // Close menu
     }, this, isHelpPaneVisible));
 
     this.listenTo(this.comm, 'clientConnect', (message) => {
@@ -149,7 +160,7 @@ export class App extends DisposableWithEvents {
       // Reload any open documents if needed (if clientId changed, or client can't get all missed
       // messages). We'll simply reload the active component of the App regardless of what it is.
       if (message.needReload) {
-        this.reloadPane();
+        this._reloadPane();
       }
     });
 
@@ -160,7 +171,7 @@ export class App extends DisposableWithEvents {
     this.listenTo(this.comm, 'docShutdown', () => {
       console.log("Received docShutdown");
       // Reload on next tick, to let other objects process 'docShutdown' before they get disposed.
-      setTimeout(() => this.reloadPane(), 0);
+      setTimeout(() => this._reloadPane(), 0);
     });
 
     this.listenTo(this.comm, 'docError', (msg: CommDocError) => {
@@ -194,13 +205,8 @@ export class App extends DisposableWithEvents {
   // "same-origin"). So this silly callback is for tests to generate a fake error.
   public testTriggerError(msg: string) { throw new Error(msg); }
 
-  public reloadPane() {
-    console.log("reloadPane");
-    this.topAppModel.reload();
-  }
-
   // Intended to be used by tests to enable specific features.
-  public enableFeature(featureName: keyof ISupportedFeatures, onOff: boolean) {
+  public testEnableFeature(featureName: keyof ISupportedFeatures, onOff: boolean) {
     const features = this.features();
     features[featureName] = onOff;
     this._settings(Object.assign(this._settings(), { features }));
@@ -213,10 +219,6 @@ export class App extends DisposableWithEvents {
   public reload() {
     G.window.location.reload(true);
     return true;
-  }
-
-  public setDocPageModel(pageModel: DocPageModel) {
-    this._mostRecentDocPageModel = pageModel;
   }
 
   /**
@@ -243,6 +245,11 @@ export class App extends DisposableWithEvents {
     return BaseAPI.numPendingRequests();
   }
 
+  private _reloadPane() {
+    console.log("reloadPane");
+    this.topAppModel.reload();
+  }
+
   private _checkError(err: Error) {
     const message = String(err);
     // Take special action on any error that suggests a memory problem.
@@ -251,7 +258,7 @@ export class App extends DisposableWithEvents {
         // TLDR
         err.message = t("Memory Error");
       }
-      this._mostRecentDocPageModel?.offerRecovery(err);
+      this.pageModel?.offerRecovery(err);
     }
   }
 }

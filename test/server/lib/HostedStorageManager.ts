@@ -8,6 +8,11 @@ import {
   AttachmentStoreProvider,
   IAttachmentStoreProvider
 } from 'app/server/lib/AttachmentStoreProvider';
+import {
+  BackupEvent,
+  backupSqliteDatabase,
+  retryOnClose,
+} from 'app/server/lib/backupSqliteDatabase';
 import {create} from 'app/server/lib/create';
 import {DocManager} from 'app/server/lib/DocManager';
 import {makeExceptionalDocSession} from 'app/server/lib/DocSession';
@@ -18,12 +23,10 @@ import {
   ExternalStorageSettings,
   wrapWithKeyMappedStorage
 } from 'app/server/lib/ExternalStorage';
-import {createDummyGristServer} from 'app/server/lib/GristServer';
+import { createDummyGristServer, GristServer } from 'app/server/lib/GristServer';
 import {
-  BackupEvent,
-  backupSqliteDatabase,
   HostedStorageManager,
-  HostedStorageOptions
+  HostedStorageOptions,
 } from 'app/server/lib/HostedStorageManager';
 import log from 'app/server/lib/log';
 import {SQLiteDB} from 'app/server/lib/SQLiteDB';
@@ -315,9 +318,19 @@ class TestStore {
         return result;
     };
 
-    const attachmentStoreProvider = this._attachmentStoreProvider ?? new AttachmentStoreProvider([], "TESTINSTALL");
+    const attachmentStoreProvider =
+      this._attachmentStoreProvider ?? new AttachmentStoreProvider([],  "TESTINSTALL");
 
-    const storageManager = new HostedStorageManager(this._localDirectory,
+    const testStore = this;
+    const gristServer: GristServer = {
+      ...createDummyGristServer(),
+      getDocManager() {
+        return testStore.docManager;
+      }
+    };
+
+    const storageManager = new HostedStorageManager(gristServer,
+                                                    this._localDirectory,
                                                     this._workerId,
                                                     false,
                                                     this._workers,
@@ -418,7 +431,8 @@ describe('HostedStorageManager', function() {
 
         tmpDir = await createTmpDir();
 
-        let externalStorageCreate: (purpose: 'doc'|'meta', extraPrefix: string) => ExternalStorage|undefined;
+        let externalStorageCreate:
+          (purpose: 'doc'|'meta'|'attachments', extraPrefix: string) => ExternalStorage|undefined;
         function requireStorage<T>(storage: T|undefined): T {
           if (storage === undefined) { throw new Error('storage not found'); }
           return storage;
@@ -526,14 +540,14 @@ describe('HostedStorageManager', function() {
 
       it('can save modifications', async function() {
         await store.run(async () => {
-          await workers.assignDocWorker('Hello');
-          await useFixtureDoc('Hello.grist', store.storageManager);
+          await workers.assignDocWorker('World');
+          await useFixtureDoc('World.grist', store.storageManager);
 
           await workers.assignDocWorker('Hello2');
 
-          const doc = await store.docManager.fetchDoc(docSession, 'Hello');
+          const doc = await store.docManager.fetchDoc(docSession, 'World');
           const doc2 = await store.docManager.fetchDoc(docSession, 'Hello2');
-          await doc.docStorage.exec("update Table1 set A = 'magic_word' where id = 1");
+          await doc.docStorage.exec("update Table1 set a = 'magic_word' where id = 1");
           await doc2.docStorage.exec("insert into Table1(id) values(42)");
           return { doc, doc2 };
         });
@@ -541,9 +555,9 @@ describe('HostedStorageManager', function() {
         await store.removeAll();
 
         await store.run(async () => {
-          const doc = await store.docManager.fetchDoc(docSession, 'Hello');
-          let result = await doc.docStorage.get("select A from Table1 where id = 1");
-          assert.equal(result!.A, 'magic_word');
+          const doc = await store.docManager.fetchDoc(docSession, 'World');
+          let result = await doc.docStorage.get("select * from Table1 where id = 1");
+          assert.equal(result!.a, 'magic_word');
           const doc2 = await store.docManager.fetchDoc(docSession, 'Hello2');
           result = await doc2.docStorage.get("select id from Table1");
           assert.equal(result!.id, 42);
@@ -997,6 +1011,7 @@ describe('HostedStorageManager', function() {
       oldEnv.restore();
     });
 
+    let docManager: DocManager;
     beforeEach(async function() {
       // With Redis disabled, this should be the non-redis version of IDocWorkerMap (DummyDocWorkerMap)
       docWorkerMap = getDocWorkerMap();
@@ -1007,7 +1022,13 @@ describe('HostedStorageManager', function() {
       });
       await docWorkerMap.setWorkerAvailability(workerId, true);
 
+      const gristServer: GristServer = {
+        ...createDummyGristServer(),
+        getDocManager() { return docManager; }
+      };
+
       defaultParams = [
+        gristServer,
         tmpDir,
         workerId,
         false,
@@ -1021,6 +1042,7 @@ describe('HostedStorageManager', function() {
     });
 
     it("doesn't wipe local docs when they exist on disk but not remote storage", async function() {
+
       const storageManager = new HostedStorageManager(...defaultParams);
 
       const docId = "NewDoc";
@@ -1062,84 +1084,146 @@ describe('HostedStorageManager', function() {
       assert.isTrue(await fse.pathExists(docPath));
     });
   });
-});
 
-// This is a performance test, to check if the backup settings are plausible.
-describe('backupSqliteDatabase', async function() {
-  it('backups are robust to locking', async function() {
-    // Takes some time to create large db and play with it.
-    this.timeout(20000);
+  // This is a performance test, to check if the backup settings are plausible.
+  describe('backupSqliteDatabase', async function() {
+    for (const mode of ['without-doc', 'with-doc', 'with-closing-doc'] as const) {
 
-    const tmpDir = await createTmpDir();
-    const src = path.join(tmpDir, "src.db");
-    const dest = path.join(tmpDir, "dest.db");
-    const db = await SQLiteDB.openDBRaw(src);
-    await db.run("create table data(x,y,z)");
-    await db.execTransaction(async () => {
-      const stmt = await db.prepare("INSERT INTO data VALUES (?,?,?)");
-      for (let i = 0; i < 10000; i++) {
-        // Silly code to make a long random string to insert.
-        // We can make a big db faster this way.
-        const str = (new Array(100)).fill(1).map((_: any) => Math.random().toString(2)).join();
-        await stmt.run(str, str, str);
-      }
-      await stmt.finalize();
-    });
-    const stat = await fse.stat(src);
-    assert(stat.size > 150 * 1000 * 1000);
-    let done: boolean = false;
-    let eventStart: number = 0;
-    let eventAction: string = "";
-    let eventCount: number = 0;
-    function progress(event: BackupEvent) {
-      if (event.phase === 'after') {
-        // Duration of backup action should never approach the default node-sqlite3 busy_timeout of 1s.
-        // If it does, then user actions could be blocked.
-        assert.equal(event.action, eventAction);
-        assert.isBelow(Date.now() - eventStart, 100);
-        eventCount++;
-      } else if (event.phase === 'before') {
-        eventStart = Date.now();
-        eventAction = event.action;
-      }
+      it(`backups are robust to locking (${mode})`, async function() {
+        // Takes some time to create large db and play with it.
+        this.timeout('30s');
+
+        const tmpDir = await createTmpDir();
+        const src = path.join(tmpDir, "src.db");
+        const dest = path.join(tmpDir, "dest.db");
+        const db = await SQLiteDB.openDBRaw(src);
+        await db.run("create table data(x,y,z)");
+        await db.execTransaction(async () => {
+          const stmt = await db.prepare("INSERT INTO data VALUES (?,?,?)");
+          for (let i = 0; i < 30000; i++) {
+            // Silly code to make a long random string to insert.
+            // We can make a big db faster this way.
+            const str = (new Array(100)).fill(1).map((_: any) => Math.random().toString(2)).join();
+            await stmt.run(str, str, str);
+          }
+          await stmt.finalize();
+        });
+        const stat = await fse.stat(src);
+        assert(stat.size > 150 * 1000 * 1000);
+        let done: boolean = false;
+        let eventStart: number = 0;
+        let eventAction: string = "";
+        let eventCount: number = 0;
+        let restartCount: number = 0;
+        let slowSteps: number = 0;
+        let slowStepsTotalTime: number = 0;
+        function progress(event: BackupEvent) {
+          if (event.phase === 'after') {
+            // Duration of backup action should never approach the default node-sqlite3 busy_timeout of 1s.
+            // If it does, then user actions could be blocked.
+            assert.equal(event.action, eventAction);
+            const dt = Date.now() - eventStart;
+            if (dt > 100) {
+              slowSteps++;
+              slowStepsTotalTime += dt;
+            }
+            eventCount++;
+          } else if (event.phase === 'before') {
+            eventStart = Date.now();
+            eventAction = event.action;
+          } else if (event.action === 'restart') {
+            restartCount++;
+          }
+        }
+        let backupError: Error|undefined;
+        const runBackup = (db: SQLiteDB|undefined) => retryOnClose(
+          db, (err) => backupError = err, () => backupSqliteDatabase(db, src, dest, progress)
+        );
+        const backup =
+            (mode === 'with-doc' || mode === 'with-closing-doc') ?
+            runBackup(db) :
+            runBackup(undefined);
+        const act = backup.then(() => done = true)
+          .catch((e) => { console.log('catch!'); done = true; backupError = e; });
+        assert(!done);
+
+        if (mode === 'with-closing-doc') {
+
+          // Wait for snapshotting to start, then close the
+          // db from under it, and see we get the expected
+          // message out.
+          for (let i = 0; i < 100; i++) {
+            await bluebird.delay(10);
+            if (eventCount > 0) {
+              // Try immediately closing the document.
+              await db.close();
+            }
+          }
+          assert.match(String(backupError), /source closed/);
+          assert.equal(done, false);
+          // Wait a while longer and see if backup terminates
+          await waitForIt(() => assert.equal(done, true), 3000, 50);
+          // That's all we can test in this test variant now we closed the db.
+          return;
+        }
+
+        // Try a series of insertions, to check that db never appears locked to us.
+        for (let i = 0; i < 100; i++) {
+          await bluebird.delay(10);
+          try {
+            await db.exec('INSERT INTO data VALUES (1,2,3)');
+          } catch (e) {
+            log.error('insertion failed, that is bad news, the db was locked for too long');
+            throw e;
+          }
+        }
+        assert(!done);
+
+        // Lock the db up completely for a while.
+        await db.exec('PRAGMA locking_mode = EXCLUSIVE');
+        await db.exec('BEGIN EXCLUSIVE');
+        await bluebird.delay(500);
+        await db.exec('COMMIT');
+        await db.exec('PRAGMA locking_mode = NORMAL');
+
+        assert(!done);
+        while (!done) {
+          // Make sure regular queries don't get in the way of backup completing
+          await db.all('select * from data limit 100');
+          await bluebird.delay(100);
+        }
+        await act;
+        if (backupError) { throw backupError; }
+
+        // Make sure we are receiving backup events and checking their timing.
+        assert.isAbove(eventCount, 100);
+
+        // Finally, check the backup looks sane.
+        const db2 = await SQLiteDB.openDBRaw(dest);
+        assert.lengthOf(await db2.all('select rowid from data'), 30000 + 100);
+
+        if (mode === 'without-doc') {
+          // If simulating a backup not done via the connection to the source database
+          // then disruption should cause backup restart.
+          assert.isAbove(restartCount, 0);
+          // There should be no slow steps.
+          assert.equal(slowSteps, 0);
+        } else {
+          // If simulating a backup done via the connection to the source database
+          // then disruption should not cause backup restart.
+          assert.equal(restartCount, 0);
+          // There may be one slowish step at the end if a lot of edits
+          // happen during backup.
+          assert.isBelow(slowSteps, 2);
+          // For this test, slow step shouldn't be too long, though
+          // that's hardware dependent.
+          // Could exceed busy time, but that isn't a problem now we
+          // are using the same db object as the rest of Grist - any
+          // work waiting will be held just like any pair of editors
+          // competing.
+          assert.isBelow(slowStepsTotalTime, 5000);
+        }
+      });
     }
-    let backupError: Error|undefined;
-    const act = backupSqliteDatabase(src, dest, progress).then(() => done = true)
-      .catch((e) => { done = true; backupError = e; });
-    assert(!done);
-    // Try a series of insertions, to check that db never appears locked to us.
-    for (let i = 0; i < 100; i++) {
-      await bluebird.delay(10);
-      try {
-        await db.exec('INSERT INTO data VALUES (1,2,3)');
-      } catch (e) {
-        log.error('insertion failed, that is bad news, the db was locked for too long');
-        throw e;
-      }
-    }
-    assert(!done);
-
-    // Lock the db up completely for a while.
-    await db.exec('PRAGMA locking_mode = EXCLUSIVE');
-    await db.exec('BEGIN EXCLUSIVE');
-    await bluebird.delay(500);
-    await db.exec('COMMIT');
-    await db.exec('PRAGMA locking_mode = NORMAL');
-
-    assert(!done);
-    while (!done) {
-      // Make sure regular queries don't get in the way of backup completing
-      await db.all('select * from data limit 100');
-      await bluebird.delay(100);
-    }
-    await act;
-    if (backupError) { throw backupError; }
-
-    // Make sure we are receiving backup events and checking their timing.
-    assert.isAbove(eventCount, 100);
-
-    // Finally, check the backup looks sane.
-    const db2 = await SQLiteDB.openDBRaw(dest);
-    assert.lengthOf(await db2.all('select rowid from data'), 10000 + 100);
   });
 });

@@ -2,7 +2,7 @@ import {ApiError} from 'app/common/ApiError';
 import {ICustomWidget} from 'app/common/CustomWidget';
 import {delay} from 'app/common/delay';
 import {encodeUrl, getSlugIfNeeded, GristDeploymentType, GristDeploymentTypes,
-        GristLoadConfig, IGristUrlState, isOrgInPathOnly, parseSubdomain,
+        GristLoadConfig, IGristUrlState, isOrgInPathOnly, LatestVersionAvailable, parseSubdomain,
         sanitizePathTail} from 'app/common/gristUrls';
 import {getOrgUrlInfo} from 'app/common/gristUrls';
 import {isAffirmative, safeJsonParse} from 'app/common/gutil';
@@ -15,11 +15,11 @@ import {Document} from 'app/gen-server/entity/Document';
 import {Organization} from 'app/gen-server/entity/Organization';
 import {User} from 'app/gen-server/entity/User';
 import {Workspace} from 'app/gen-server/entity/Workspace';
-import {Activations} from 'app/gen-server/lib/Activations';
+import {ActivationsManager} from 'app/gen-server/lib/ActivationsManager';
 import {DocApiForwarder} from 'app/gen-server/lib/DocApiForwarder';
 import {getDocWorkerMap} from 'app/gen-server/lib/DocWorkerMap';
 import {Doom} from 'app/gen-server/lib/Doom';
-import {HomeDBManager} from 'app/gen-server/lib/homedb/HomeDBManager';
+import {HomeDBManager, NotifierEvents, UserChange} from 'app/gen-server/lib/homedb/HomeDBManager';
 import {Housekeeper} from 'app/gen-server/lib/Housekeeper';
 import {Usage} from 'app/gen-server/lib/Usage';
 import {AccessTokens, IAccessTokens} from 'app/server/lib/AccessTokens';
@@ -28,7 +28,10 @@ import {attachAppEndpoint} from 'app/server/lib/AppEndpoint';
 import {appSettings} from 'app/server/lib/AppSettings';
 import {attachEarlyEndpoints} from 'app/server/lib/attachEarlyEndpoints';
 import {
-  AttachmentStoreProvider, checkAvailabilityAttachmentStoreOptions, IAttachmentStoreProvider
+  AttachmentStoreProvider,
+  checkAvailabilityAttachmentStoreOptions,
+  getConfiguredAttachmentStoreConfigs,
+  IAttachmentStoreProvider
 } from 'app/server/lib/AttachmentStoreProvider';
 import {addRequestUser, getTransitiveHeaders, getUser, getUserId, isAnonymousUser,
         isSingleUserMode, redirectToLoginUnconditionally} from 'app/server/lib/Authorizer';
@@ -41,6 +44,7 @@ import {create} from 'app/server/lib/create';
 import {addDiscourseConnectEndpoints} from 'app/server/lib/DiscourseConnect';
 import {addDocApiRoutes} from 'app/server/lib/DocApi';
 import {DocManager} from 'app/server/lib/DocManager';
+import {getSqliteMode} from 'app/server/lib/DocStorage';
 import {DocWorker} from 'app/server/lib/DocWorker';
 import {DocWorkerInfo, IDocWorkerMap} from 'app/server/lib/DocWorkerMap';
 import {expressWrap, jsonErrorHandler, secureJsonErrorHandler} from 'app/server/lib/expressWrap';
@@ -53,7 +57,7 @@ import {initGristSessions, SessionStore} from 'app/server/lib/gristSessions';
 import {IAuditLogger} from 'app/server/lib/IAuditLogger';
 import {IBilling} from 'app/server/lib/IBilling';
 import {IDocStorageManager} from 'app/server/lib/IDocStorageManager';
-import {EmptyNotifier, INotifier} from 'app/server/lib/INotifier';
+import {EmptyNotifier, INotifier, TestSendGridExtensions} from 'app/server/lib/INotifier';
 import {InstallAdmin} from 'app/server/lib/InstallAdmin';
 import log from 'app/server/lib/log';
 import {IPermitStore} from 'app/server/lib/Permit';
@@ -66,7 +70,7 @@ import {adaptServerUrl, getOrgUrl, getOriginUrl, getScope, integerParam, isParam
         trustOrigin} from 'app/server/lib/requestUtils';
 import {buildScimRouter} from 'app/server/lib/scim';
 import {ISendAppPageOptions, makeGristConfig, makeMessagePage, makeSendAppPage} from 'app/server/lib/sendAppPage';
-import {getDatabaseUrl, listenPromise, timeoutReached} from 'app/server/lib/serverUtils';
+import {getDatabaseUrl, getPubSubPrefix, listenPromise, timeoutReached} from 'app/server/lib/serverUtils';
 import {Sessions} from 'app/server/lib/Sessions';
 import * as shutdown from 'app/server/lib/shutdown';
 import {TagChecker} from 'app/server/lib/TagChecker';
@@ -79,6 +83,7 @@ import {buildWidgetRepository, getWidgetsInPlugins, IWidgetRepository} from 'app
 import {setupLocale} from 'app/server/localization';
 import axios from 'axios';
 import * as cookie from 'cookie';
+import EventEmitter from 'events';
 import express from 'express';
 import * as fse from 'fs-extra';
 import * as http from 'http';
@@ -91,6 +96,7 @@ import morganLogger from 'morgan';
 import {AddressInfo} from 'net';
 import fetch from 'node-fetch';
 import * as path from 'path';
+import {createClient, RedisClient} from 'redis';
 import * as serveStatic from 'serve-static';
 
 // Health checks are a little noisy in the logs, so we don't show them all.
@@ -135,7 +141,7 @@ export class FlexServer implements GristServer {
   public electronServerMethods: ElectronServerMethods;
   public readonly docsRoot: string;
   public readonly i18Instance: i18n;
-  private _activations: Activations;
+  private _activations: ActivationsManager;
   private _comm: Comm;
   private _deploymentType: GristDeploymentType;
   private _dbManager: HomeDBManager;
@@ -194,10 +200,14 @@ export class FlexServer implements GristServer {
   private _updateManager: UpdateManager;
   private _sandboxInfo: SandboxInfo;
   private _jobs?: GristJobs;
+  private _emitNotifier = new EmitNotifier();
+  private _testPendingNotifications: number = 0;
+  private _latestVersionAvailable?: LatestVersionAvailable;
+  private _redisSubscriptionClient?: RedisClient|null;
 
   constructor(public port: number, public name: string = 'flexServer',
               public readonly options: FlexServerOptions = {}) {
-    this._getLoginSystem = create.getLoginSystem;
+    this._getLoginSystem = create.getLoginSystem.bind(create);
     this.settings = options.settings;
     this.app = express();
     this.app.set('port', port);
@@ -247,6 +257,11 @@ export class FlexServer implements GristServer {
     }
     this.info.push(['defaultBaseDomain', this._defaultBaseDomain]);
     this._pluginUrl = options.pluginUrl || process.env.APP_UNTRUSTED_URL;
+
+    if (process.env.REDIS_URL) {
+      this._redisSubscriptionClient = createClient(process.env.REDIS_URL);
+      this._subscribeToVersionUpdates();
+    }
 
     // The electron build is not supported at this time, but this stub
     // implementation of electronServerMethods is present to allow kicking
@@ -392,7 +407,7 @@ export class FlexServer implements GristServer {
     return this._hosts;
   }
 
-  public getActivations(): Activations {
+  public getActivations(): ActivationsManager {
     if (!this._activations) { throw new Error('no activations available'); }
     return this._activations;
   }
@@ -432,8 +447,10 @@ export class FlexServer implements GristServer {
   }
 
   public getNotifier(): INotifier {
+    // Check that our internal notifier implementation is in place.
     if (!this._notifier) { throw new Error('no notifier available'); }
-    return this._notifier;
+    // Expose a wrapper around it that emits actions.
+    return this._emitNotifier;
   }
 
   public getInstallAdmin(): InstallAdmin {
@@ -794,14 +811,14 @@ export class FlexServer implements GristServer {
 
   public async initHomeDBManager() {
     if (this._check('homedb')) { return; }
-    this._dbManager = new HomeDBManager();
+    this._dbManager = new HomeDBManager(this._emitNotifier);
     this._dbManager.setPrefix(process.env.GRIST_ID_PREFIX || "");
     await this._dbManager.connect();
     await this._dbManager.initializeSpecialIds();
     // Report which database we are using, without sensitive credentials.
     this.info.push(['database', getDatabaseUrl(this._dbManager.connection.options, false)]);
     // If the installation appears to be new, give it an id and a creation date.
-    this._activations = new Activations(this._dbManager);
+    this._activations = new ActivationsManager(this._dbManager);
     await this._activations.current();
     this._installAdmin = await this.create.createInstallAdmin(this._dbManager);
   }
@@ -920,9 +937,9 @@ export class FlexServer implements GristServer {
     this.getBilling().addEventHandlers();
   }
 
-  public async addBillingMiddleware() {
+  public addBillingMiddleware() {
     if (this._check('activation', 'homedb')) { return; }
-    await this.getBilling().addMiddleware?.(this.app);
+    this.getBilling().addMiddleware?.(this.app);
   }
 
   /**
@@ -971,8 +988,8 @@ export class FlexServer implements GristServer {
     await this._updateManager?.clear();
     if (this.usage)  { await this.usage.close(); }
     if (this._hosts) { this._hosts.close(); }
+    this._emitNotifier.removeAllListeners();
     if (this._dbManager) {
-      this._dbManager.removeAllListeners();
       this._dbManager.flushDocAuthCache();
     }
     if (this.server)      { this.server.close(); }
@@ -985,6 +1002,8 @@ export class FlexServer implements GristServer {
     if (this._docWorkerMap) { await this._docWorkerMap.close(); }
     if (this._sessionStore) { await this._sessionStore.close(); }
     if (this._auditLogger) { await this._auditLogger.close(); }
+    if (this._billing) { await this._billing.close?.(); }
+    if (this._redisSubscriptionClient) { await this._redisSubscriptionClient.quitAsync(); }
   }
 
   public addDocApiForwarder() {
@@ -1358,6 +1377,9 @@ export class FlexServer implements GristServer {
     if (!this._docManager) { this.addCleanup(); }
     await this.addLoginMiddleware();
     this.addComm();
+    // Check SQLite mode so it shows up in initial configuration readout
+    // (even though we don't need it until opening documents).
+    getSqliteMode();
 
     await this.create.configure?.();
 
@@ -1376,27 +1398,28 @@ export class FlexServer implements GristServer {
       const docWorkerId = await this._addSelfAsWorker(workers);
 
       const storageManager = await this.create.createHostedDocStorageManager(
-        this.docsRoot, docWorkerId, this._disableExternalStorage, workers, this._dbManager, this.create.ExternalStorage
+        this, this.docsRoot, docWorkerId, this._disableExternalStorage, workers, this._dbManager,
+        this.create.ExternalStorage.bind(this.create)
       );
       this._storageManager = storageManager;
     } else {
       const samples = getAppPathTo(this.appRoot, 'public_samples');
       const storageManager = await this.create.createLocalDocStorageManager(
-        this.docsRoot, samples, this._comm, this.create.Shell?.()
-      );
+        this.docsRoot, samples, this._comm, undefined, this);
       this._storageManager = storageManager;
     }
 
     const pluginManager = await this._addPluginManager();
 
-    const storeOptions = await checkAvailabilityAttachmentStoreOptions(this.create.getAttachmentStoreOptions());
+    const allStoreOptions = Object.values(this.create.getAttachmentStoreOptions());
+    const checkedStoreOptions = await checkAvailabilityAttachmentStoreOptions(allStoreOptions);
     log.info("Attachment store backend availability", {
-      available: storeOptions.available.map(option => option.name),
-      unavailable: storeOptions.unavailable.map(option => option.name),
+      available: checkedStoreOptions.available.map(option => option.name),
+      unavailable: checkedStoreOptions.unavailable.map(option => option.name),
     });
 
     this._attachmentStoreProvider = this._attachmentStoreProvider || new AttachmentStoreProvider(
-      storeOptions.available,
+      await getConfiguredAttachmentStoreConfigs(),
       (await this.getActivations().current()).id,
     );
     this._docManager = this._docManager || new DocManager(this._storageManager,
@@ -1833,6 +1856,25 @@ export class FlexServer implements GristServer {
     // case of notification(s) from stripe.  May need to associate a preferred base domain
     // with org/user and persist that?
     this._notifier = this.create.Notifier(this._dbManager, this);
+    for (const method of NotifierEvents.values) {
+      this._emitNotifier.on(method, async (...args) => {
+        this._testPendingNotifications++;
+        try {
+          await (this._notifier[method] as any)(...args);
+        } catch (e) {
+          // Catch error since as an event handler we can't return one.
+          log.error("Notifier failed:", e);
+        } finally {
+          this._testPendingNotifications--;
+        }
+      });
+    }
+    this._emitNotifier.sendGridExtensions = this._notifier.testSendGridExtensions?.();
+  }
+
+  // for test purposes, check if any notifications are in progress
+  public get testPending(): boolean {
+    return this._testPendingNotifications > 0;
   }
 
   public getGristConfig(): GristLoadConfig {
@@ -1949,6 +1991,38 @@ export class FlexServer implements GristServer {
 
     const configBackendAPI = new ConfigBackendAPI();
     configBackendAPI.addEndpoints(this.app, requireInstallAdmin);
+
+    // Some configurations may add extra endpoints. This seems a fine time to add them.
+    this.create.addExtraHomeEndpoints(this, this.app);
+  }
+
+  public getLatestVersionAvailable() {
+    return this._latestVersionAvailable;
+  }
+
+  public setLatestVersionAvailable(latestVersionAvailable: LatestVersionAvailable): void {
+    log.info(`Setting ${latestVersionAvailable.version} as the latest available version`);
+    this._latestVersionAvailable = latestVersionAvailable;
+  }
+
+  public async publishLatestVersionAvailable(latestVersionAvailable: LatestVersionAvailable): Promise<void> {
+    log.info(`Publishing ${latestVersionAvailable.version} as the latest available version`);
+
+    if (process.env.REDIS_URL) {
+      const client = createClient(process.env.REDIS_URL);
+      const prefix = getPubSubPrefix();
+      const channel = `${prefix}-latestVersionAvailable`;
+      try {
+        await client.publishAsync(channel, JSON.stringify(latestVersionAvailable));
+      } catch(error) {
+        log.error(`Error publishing latest version`, {error, latestVersionAvailable});
+      } finally {
+        await client.quitAsync();
+      }
+    } else {
+      // No Redis, so let's assume this is a single-server setup and skip pub/sub
+      this.setLatestVersionAvailable(latestVersionAvailable);
+    }
   }
 
   // Get the HTML template sent for document pages.
@@ -1995,6 +2069,18 @@ export class FlexServer implements GristServer {
 
   public setRestrictedMode(restrictedMode = true) {
     this.getHomeDBManager().setReadonly(restrictedMode);
+  }
+
+  public isRestrictedMode() {
+    return this.getHomeDBManager().isReadonly();
+  }
+
+  public onUserChange(callback: (change: UserChange) => Promise<void>) {
+    this._emitNotifier.on('userChange', callback);
+  }
+
+  public onStreamingDestinationsChange(callback: (orgId?: number) => Promise<void>) {
+    this._emitNotifier.on('streamingDestinationsChange', callback);
   }
 
   // Adds endpoints that support imports and exports.
@@ -2260,6 +2346,23 @@ export class FlexServer implements GristServer {
       return true;
     }
     return false;
+  }
+
+  private _subscribeToVersionUpdates() {
+    // If we have a Redis client, subscribe it to get version updates
+    if (this._redisSubscriptionClient) {
+      const prefix = getPubSubPrefix();
+      const channel = `${prefix}-latestVersionAvailable`;
+      this._redisSubscriptionClient.subscribe(channel);
+      this._redisSubscriptionClient.on("message", async (_, message) => {
+        const latestVersionAvailable: LatestVersionAvailable = JSON.parse(message);
+        log.debug('subscribeToVersionUpdates: setting latest version', latestVersionAvailable);
+        this.setLatestVersionAvailable(latestVersionAvailable);
+      });
+      this._redisSubscriptionClient.on("error", async (error) => {
+        log.warn('subscribeToVersionUpdates: redis client error', error);
+      });
+    }
   }
 
   private _createServers() {
@@ -2612,3 +2715,52 @@ const serveAnyOrigin: serveStatic.ServeStaticOptions = {
     res.setHeader("Access-Control-Allow-Origin", "*");
   }
 };
+
+/**
+ *
+ * Handle events that should result in notifications to users via
+ * transactional emails (or future generalizations). Currently
+ * handled by simply emitting them and hooking them up to a
+ * sendgrid-based implementation (see FlexServer.addNotifier).
+ * Some of the events are also distributed internally via
+ * FlexServer.onUserChange and FlexServer.onStreamingDestinationsChange.
+ * This might be a good point to replace some of this activity with
+ * a job queue and queue workers. In particular, processing of
+ * FlexServer.onUserChange could do with moving to a queue since
+ * it may require communication with external billing software and
+ * should be robust to delays and failures there. More generally,
+ * if notications are subject to delays and failures and we wish to
+ * be robust, a job queue would be a good idea for all of this.
+ *
+ * Although the interface this class implements is async, it is
+ * best if the implementation remains fast and reliable. Any delays
+ * here will impact API calls. Calls to place something in Redis
+ * may be acceptable.
+ */
+export class EmitNotifier extends EventEmitter implements INotifier {
+  public sendGridExtensions?: TestSendGridExtensions;
+
+  public addUser = this._wrapEvent('addUser');
+  public addBillingManager = this._wrapEvent('addBillingManager');
+  public firstLogin = this._wrapEvent('firstLogin');
+  public teamCreator = this._wrapEvent('teamCreator');
+  public userChange = this._wrapEvent('userChange');
+  public trialPeriodEndingSoon = this._wrapEvent('trialPeriodEndingSoon');
+  public trialingSubscription = this._wrapEvent('trialingSubscription');
+  public scheduledCall = this._wrapEvent('scheduledCall');
+  public streamingDestinationsChange = this._wrapEvent('streamingDestinationsChange');
+  public twoFactorStatusChanged = this._wrapEvent('twoFactorStatusChanged');
+
+  // Pass on deleteUser in the same way
+  public deleteUser = this._wrapEvent('deleteUser');
+
+  public testSendGridExtensions() {
+    return this.sendGridExtensions;
+  }
+
+  private _wrapEvent<Name extends keyof INotifier>(eventName: Name): INotifier[Name] {
+    return (async (...args: any[]) => {
+      this.emit(eventName, ...args);
+    }) as INotifier[Name];
+  }
+}

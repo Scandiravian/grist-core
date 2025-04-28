@@ -229,7 +229,7 @@ export interface ViewSectionRec extends IRowModel<"_grist_Views_section">, RuleO
 
   // Temporary variable holding columns mapping requested by the widget (set by API).
   columnsToMap: ko.Observable<ColumnsToMap|null>;
-  // Temporary variable holding columns mapped by the user;
+  // Map from widget columns to colIds in document.
   mappedColumns: ko.Computed<WidgetColumnMap|null>;
   // Temporary variable holding flag that describes if the widget supports custom options (set by API).
   hasCustomOptions: ko.Observable<boolean>;
@@ -261,6 +261,23 @@ export interface ViewSectionRec extends IRowModel<"_grist_Views_section">, RuleO
   columnsType: ko.PureComputed<string|'mixed'>;
 
   widgetType: modelUtil.KoSaveableObservable<WidgetType>;
+
+  /** Should the layout menu be hidden */
+  hideViewMenu: ko.Observable<boolean>;
+
+  /**
+   * If the section can be expanded (default true), used mostly by virtual tables. If undefined defaults to the caller
+   */
+  canExpand: ko.Observable<boolean>;
+
+  /**
+   * If the section can be renamed, used mostly by virtual tables. If undefined defaults to the caller
+   * of the buildViewSectionDom function (which in turn defaults to true).
+   */
+  canRename: ko.Observable<boolean|undefined>;
+
+  // If set, overrides the value of disableAddRemoveRows().
+  overrideDisableAddRemoveRows: ko.Observable<boolean|undefined>;
 
   // Save all filters of fields/columns in the section.
   saveFilters(): Promise<void>;
@@ -755,7 +772,8 @@ export function createViewSectionRec(this: ViewSectionRec, docModel: DocModel): 
     scrollLeft: 0  // Used for grid sections. Indicates the scrollLeft value of the scroll pane.
   };
 
-  this.disableAddRemoveRows = ko.pureComputed(() => this.table().disableAddRemoveRows());
+  this.disableAddRemoveRows = ko.pureComputed(() =>
+    this.overrideDisableAddRemoveRows() ?? this.table().disableAddRemoveRows());
 
   this.isSorted = ko.pureComputed(() => this.activeSortSpec().length > 0);
   this.disableDragRows = ko.pureComputed(() => this.isSorted() || !this.table().supportsManualSort());
@@ -902,4 +920,10 @@ export function createViewSectionRec(this: ViewSectionRec, docModel: DocModel): 
       await docModel.viewFields.sendTableAction(action);
     }
   };
+
+
+  this.hideViewMenu = ko.observable(false);
+  this.canRename = ko.observable<boolean|undefined>(undefined);
+  this.canExpand = ko.observable<boolean>(true);
+  this.overrideDisableAddRemoveRows = ko.observable<boolean|undefined>(undefined);
 }

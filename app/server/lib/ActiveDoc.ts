@@ -80,8 +80,8 @@ import {schema, SCHEMA_VERSION} from 'app/common/schema';
 import {MetaRowRecord, SingleCell} from 'app/common/TableData';
 import {TelemetryEvent, TelemetryMetadataByLevel} from 'app/common/Telemetry';
 import {FetchUrlOptions, UploadResult} from 'app/common/uploads';
-import {Document as APIDocument, DocReplacementOptions,
-        DocState, DocStateComparison, NEW_DOCUMENT_CODE} from 'app/common/UserAPI';
+import {Document as APIDocument, AttachmentTransferStatus,
+        DocReplacementOptions, DocState, DocStateComparison, NEW_DOCUMENT_CODE} from 'app/common/UserAPI';
 import {convertFromColumn} from 'app/common/ValueConverter';
 import {guessColInfo} from 'app/common/ValueGuesser';
 import {parseUserAction} from 'app/common/ValueParser';
@@ -90,6 +90,12 @@ import {Share} from 'app/gen-server/entity/Share';
 import {RecordWithStringId} from 'app/plugin/DocApiTypes';
 import {ParseFileResult, ParseOptions} from 'app/plugin/FileParserAPI';
 import {AccessTokenOptions, AccessTokenResult, GristDocAPI, UIRowId} from 'app/plugin/GristAPI';
+import {
+  Archive,
+  ArchiveEntry, CreatableArchiveFormats,
+  create_tar_archive,
+  create_zip_archive, unpackTarArchive
+} from 'app/server/lib/Archive';
 import {AssistanceSchemaPromptV1Context} from 'app/server/lib/Assistance';
 import {AssistanceContext} from 'app/common/AssistancePrompts';
 import {AuditEventAction} from 'app/server/lib/AuditEvent';
@@ -131,13 +137,15 @@ import {IMessage, MsgType} from 'grain-rpc';
 import imageSize from 'image-size';
 import * as moment from 'moment-timezone';
 import fetch from 'node-fetch';
+import stream from 'node:stream';
+import path from 'path';
 import {createClient, RedisClient} from 'redis';
 import tmp from 'tmp';
 
 import {ActionHistory} from './ActionHistory';
 import {ActionHistoryImpl} from './ActionHistoryImpl';
 import {ActiveDocImport, FileImportOptions} from './ActiveDocImport';
-import {AttachmentFileManager} from './AttachmentFileManager';
+import {AttachmentFileManager, MismatchedFileHashError} from './AttachmentFileManager';
 import {IAttachmentStoreProvider} from './AttachmentStoreProvider';
 import {DocClients} from './DocClients';
 import {DocPluginManager} from './DocPluginManager';
@@ -286,11 +294,11 @@ export class ActiveDoc extends EventEmitter {
   constructor(
     private readonly _docManager: DocManager,
     private _docName: string,
-    externalAttachmentStoreProvider?: IAttachmentStoreProvider,
+    private _attachmentStoreProvider?: IAttachmentStoreProvider,
     private _options?: ICreateActiveDocOptions
   ) {
     super();
-    const { forkId, snapshotId } = parseUrlId(_docName);
+    const { trunkId, forkId, snapshotId } = parseUrlId(_docName);
     this._isSnapshot = Boolean(snapshotId);
     this._isForkOrSnapshot = Boolean(forkId || snapshotId);
     if (!this._isSnapshot) {
@@ -392,13 +400,23 @@ export class ActiveDoc extends EventEmitter {
       loadTable: this._rawPyCall.bind(this, 'load_table'),
     });
 
-    // This will throw errors if _options?.doc or externalAttachmentStoreProvider aren't provided,
+    // This will throw errors if _options?.doc or _attachmentStoreProvider aren't provided,
     // and ActiveDoc tries to use an external attachment store.
     this._attachmentFileManager = new AttachmentFileManager(
       this.docStorage,
-      externalAttachmentStoreProvider,
-      _options?.doc,
+      _attachmentStoreProvider,
+      forkId ? { id: forkId, trunkId, } : { id: trunkId, trunkId: undefined },
     );
+
+    // Every time manager starts the transfer we need to notify clients about it.
+    const notifier = this.sendAttachmentTransferStatusNotification.bind(this);
+
+    // Manager emits to events, at the start and at the end, but we don't care here, we
+    // just want to notify about the current status. We also don't need to unregister
+    // as the manager will be shutdown with us.
+    this._attachmentFileManager
+      .on(AttachmentFileManager.events.TRANSFER_STARTED, notifier)
+      .on(AttachmentFileManager.events.TRANSFER_COMPLETED, notifier);
 
     // Our DataEngine is a separate sandboxed process (one sandbox per open document,
     // corresponding to one process for pynbox, more for gvisor).
@@ -600,6 +618,7 @@ export class ActiveDoc extends EventEmitter {
     this._log.debug(docSession, "createEmptyDocWithDataEngine");
     await this._docManager.storageManager.prepareToCreateDoc(this.docName);
     await this.docStorage.createFile();
+    this._registerSQLiteDB();
     await this._rawPyCall('load_empty');
     // This init action is special. It creates schema tables, and is used to init the DB, but does
     // not go through other steps of a regular action (no ActionHistory or broadcasting).
@@ -667,6 +686,7 @@ export class ActiveDoc extends EventEmitter {
           },
         });
       }
+      this._registerSQLiteDB();
 
       await this._loadOpenDoc(docSession);
       const metaTableData = await this._tableMetadataLoader.fetchTablesAsActions();
@@ -869,8 +889,12 @@ export class ActiveDoc extends EventEmitter {
           }
         }
       );
-      const userActions: UserAction[] = await Promise.all(
-        upload.files.map(file => this._prepAttachment(docSession, file)));
+      const userActions: UserAction[] = [];
+      // Process uploads sequentially to reduce risk of race conditions.
+      // Minimal performance impact due to the main async operation being serialized SQL queries.
+      for (const file of upload.files) {
+        userActions.push(await this._prepAttachment(docSession, file));
+      }
       const result = await this._applyUserActionsWithExtendedOptions(docSession, userActions, {
         attachment: true,
       });
@@ -943,6 +967,146 @@ export class ActiveDoc extends EventEmitter {
     return data;
   }
 
+  public async getAttachmentsArchive(docSession: OptDocSession,
+                                     format: CreatableArchiveFormats = 'zip'): Promise<Archive> {
+    if (
+      !await this._granularAccess.canReadEverything(docSession) &&
+      !await this.canDownload(docSession)
+    ) {
+      throw new ApiError("Insufficient access to download attachments", 403);
+    }
+    if (!this.docData) {
+      throw new Error("No doc data");
+    }
+    const attachments = this.docData.getMetaTable('_grist_Attachments').getRecords();
+    const attachmentFileManager = this._attachmentFileManager;
+    const doc = this;
+
+    async function* fileGenerator(): AsyncGenerator<ArchiveEntry> {
+      const filesAdded = new Set<string>();
+      for (const attachment of attachments) {
+        if (doc._shuttingDown) {
+          throw new ApiError("Document is shutting down, archiving aborted", 500);
+        }
+        const file = await attachmentFileManager.getFile(attachment.fileIdent);
+        const name = attachmentToArchiveFilePath(attachment);
+        // This should only happen if a file has identical name *and* identifier.
+        if (filesAdded.has(name)) {
+          continue;
+        }
+        filesAdded.add(name);
+        yield({
+          name,
+          size: file.metadata.size,
+          data: file.contentStream,
+        });
+      }
+    }
+
+    if (format == 'tar') {
+      return create_tar_archive(fileGenerator());
+    }
+    if (format == 'zip') {
+      return create_zip_archive({ store: true }, fileGenerator());
+    }
+    // Generally this won't happen, as long as the above is exhaustive over the type of `format`
+    throw new ApiError(`Unsupported archive format ${format}`, 400);
+  }
+
+  @ActiveDoc.keepDocOpen
+  public async addMissingFilesFromArchive(docSession: OptDocSession,
+                                          tarFile: stream.Readable): Promise<ArchiveUploadResult> {
+    if(!await this.isOwner(docSession)) {
+      throw new ApiError("Insufficient access to upload an attachment archive", 403);
+    }
+
+    const fallbackStoreId = this._getDocumentSettings().attachmentStoreId;
+    const results: ArchiveUploadResult = {
+      added: 0,
+      errored: 0,
+      unused: 0,
+    };
+
+    await unpackTarArchive(tarFile, async (file) => {
+      try {
+        const fileIdent = archiveFilePathToAttachmentIdent(file.path);
+        const isAdded = await this._attachmentFileManager.addMissingFileData(
+          fileIdent,
+          file.data,
+          fallbackStoreId,
+        );
+        if (isAdded) {
+          results.added += 1;
+        } else {
+          results.unused += 1;
+        }
+      } catch (err) {
+        results.errored += 1;
+        if (err instanceof MismatchedFileHashError) {
+          this._log.warn(docSession, `Failed to upload attachment: ${err.message}`);
+        }
+        this._log.error(docSession, `Failed to upload attachment: ${err}`);
+      }
+    });
+
+    return results;
+  }
+
+  @ActiveDoc.keepDocOpen
+  public async startTransferringAllAttachmentsToDefaultStore() {
+    const attachmentStoreId = this._getDocumentSettings().attachmentStoreId;
+    // If no attachment store is set on the doc, it should transfer everything to internal storage
+    await this._attachmentFileManager.startTransferringAllFilesToOtherStore(attachmentStoreId);
+  }
+
+  /**
+   * Returns a summary of pending attachment transfers between attachment stores.
+   */
+  public async attachmentTransferStatus() {
+    return {
+      status: this._attachmentFileManager.transferStatus(),
+      locationSummary: await this._attachmentFileManager.locationSummary(),
+    };
+  }
+
+  /**
+   * Returns a summary of where attachments on this doc are stored.
+   */
+  public async attachmentLocationSummary() {
+    return await this._attachmentFileManager.locationSummary();
+  }
+
+  /*
+   * Wait for all attachment transfers to be finished, keeping the doc open
+   * for as long as possible.
+   */
+  @ActiveDoc.keepDocOpen
+  public async allAttachmentTransfersCompleted() {
+    await this._attachmentFileManager.allTransfersCompleted();
+  }
+
+
+  public async setAttachmentStore(docSession: OptDocSession, id: string | undefined): Promise<void> {
+    const docSettings = this._getDocumentSettings();
+    docSettings.attachmentStoreId = id;
+    await this._updateDocumentSettings(docSession, docSettings);
+    await this.sendAttachmentTransferStatusNotification(await this.attachmentTransferStatus());
+  }
+
+  /**
+   * Sets the document attachment store using the store's label.
+   * This avoids needing to know the exact store ID, which can be challenging to calculate in all
+   * the places we might want to set the store.
+   */
+  public async setAttachmentStoreFromLabel(docSession: OptDocSession, label: string | undefined): Promise<void> {
+    const id = label === undefined ? undefined : this._attachmentStoreProvider?.getStoreIdFromLabel(label);
+    await this.setAttachmentStore(docSession, id);
+  }
+
+  public async getAttachmentStore(): Promise<string | undefined> {
+    return this._getDocumentSettings().attachmentStoreId;
+  }
+
   /**
    * Fetches the meta tables to return to the client when first opening a document.
    */
@@ -1013,6 +1177,10 @@ export class ActiveDoc extends EventEmitter {
    */
   public async fetchQuery(docSession: OptDocSession, query: ServerQuery,
                           waitForFormulas: boolean = false): Promise<TableFetchResult> {
+    // Sanitize the query to ensure it only has parts we are OK accepting from the user.
+    // (In particular, it is not safe to accept an untrusted "where" part.)
+    query = pick(query, ['tableId', 'filters', 'limit']);
+
     this._inactivityTimer.ping();     // The doc is in active use; ping it to stay open longer.
 
     // If user does not have rights to access what this query is asking for, fail.
@@ -1522,8 +1690,9 @@ export class ActiveDoc extends EventEmitter {
     try {
       const parsedAclFormula = await this._pyCall('parse_predicate_formula', text);
       compilePredicateFormula(parsedAclFormula);
-      // TODO We also need to check the validity of attributes, and of tables and columns
-      // mentioned in resources and userAttribute rules.
+      // Note that the validity of attributes, and of tables and columns mentioned in resources
+      // and userAttribute rules are checked at a different point, in findRuleProblems() called
+      // from getAclResources().
       return getPredicateFormulaProperties(parsedAclFormula);
     } catch (e) {
       e.message = e.message?.replace('[Sandbox] ', '');
@@ -1873,6 +2042,17 @@ export class ActiveDoc extends EventEmitter {
     });
   }
 
+  /**
+   * Sends a message to clients connected to the document that the attachments' transfer
+   * job has started or finished. It is also sent when the attachment store is changed
+   * through the API (as it also includes information about attachments' location).
+   */
+  public async sendAttachmentTransferStatusNotification(attachmentTransfer: AttachmentTransferStatus) {
+    await this.docClients.broadcastDocMessage(null, 'docChatter', {
+      attachmentTransfer
+    });
+  }
+
   public async sendTimingsNotification() {
     await this.docClients.broadcastDocMessage(null, 'docChatter', {
       timing: {
@@ -2109,6 +2289,7 @@ export class ActiveDoc extends EventEmitter {
     };
 
     try {
+
       this.setMuted();
       this._inactivityTimer.disable();
       if (this.docClients.clientCount() > 0) {
@@ -2119,6 +2300,10 @@ export class ActiveDoc extends EventEmitter {
       }
 
       this._triggers.shutdown();
+
+      // attachmentFileManager needs to shut down before DocStorage, to allow transfers to finish.
+      await safeCallAndWait('attachmentFileManager',
+        this._attachmentFileManager.shutdown.bind(this._attachmentFileManager));
 
       this._redisSubscriber?.quitAsync()
         .catch(e => this._log.warn(docSession, "Failed to quit redis subscriber", e));
@@ -2168,6 +2353,7 @@ export class ActiveDoc extends EventEmitter {
           // tests.
           await timeoutReached(3000, this.waitForInitialization());
         }
+        this._docManager.unregisterSQLiteDB(this.docName);
         await Promise.all([
           this.docStorage.shutdown(),
           this.docPluginManager?.shutdown(),
@@ -2368,7 +2554,7 @@ export class ActiveDoc extends EventEmitter {
       dimensions.height = 0;
       dimensions.width = 0;
     }
-    const attachmentStoreId = (await this._getDocumentSettings()).attachmentStoreId;
+    const attachmentStoreId = this._getDocumentSettings().attachmentStoreId;
     const addFileResult = await this._attachmentFileManager
       .addFile(attachmentStoreId, fileData.ext, await readFile(fileData.absPath));
     this._log.info(
@@ -2849,14 +3035,33 @@ export class ActiveDoc extends EventEmitter {
     return this._dataEngine;
   }
 
-  private async _getDocumentSettings(): Promise<DocumentSettings> {
-    const docInfo = await this.docStorage.get('SELECT documentSettings FROM _grist_DocInfo');
-    const docSettingsString = docInfo?.documentSettings;
-    const docSettings = docSettingsString ? safeJsonParse(docSettingsString, undefined) : undefined;
+  private _getDocumentSettings(): DocumentSettings {
+    const docSettings = this.docData?.docSettings();
     if (!docSettings) {
       throw new Error("No document settings found");
     }
     return docSettings;
+  }
+
+  private async _getDocumentSettingsIfPresent(): Promise<DocumentSettings|undefined> {
+    try {
+      return this._getDocumentSettings();
+    } catch (e) {
+      // If called before docData is initialized, pick up docSettings directly from SQLite.
+      const docInfo = await this.docStorage.get('SELECT documentSettings FROM _grist_DocInfo').catch(() => undefined);
+      return safeJsonParse(docInfo?.documentSettings || '', undefined);
+    }
+  }
+
+  private async _updateDocumentSettings(docSessions: OptDocSession, settings: DocumentSettings): Promise<void> {
+    const docInfo = this.docData?.docInfo();
+    if (!docInfo) {
+      throw new Error("No document info found");
+    }
+    await this.applyUserActions(docSessions, [
+      // Use docInfo.id to avoid hard-coding a reference to a specific row id, in case it changes.
+      ["UpdateRecord", "_grist_DocInfo", docInfo.id, { documentSettings: JSON.stringify(settings) }]
+    ]);
   }
 
   private async _makeEngine(): Promise<ISandbox> {
@@ -2865,7 +3070,7 @@ export class ActiveDoc extends EventEmitter {
 
     // Careful, migrations may not have run on this document and it may not have a
     // documentSettings column.  Failures are treated as lack of an engine preference.
-    const docSettings = await this._getDocumentSettings().catch(e => undefined);
+    const docSettings = await this._getDocumentSettingsIfPresent();
     if (docSettings) {
       const engine = docSettings.engine;
       if (engine) {
@@ -3021,6 +3226,15 @@ export class ActiveDoc extends EventEmitter {
       },
     });
   }
+
+  /**
+   * Register the underlying SQLiteDB we have so that it can
+   * be used for backup operations. It is important to use
+   * the same SQLite connection for all operations.
+   */
+  private _registerSQLiteDB() {
+    this._docManager.registerSQLiteDB(this.docName, this.docStorage.getDB());
+  }
 }
 
 // Helper to initialize a sandbox action bundle with no values.
@@ -3127,4 +3341,30 @@ function getTelemetryMeta(docSession: OptDocSession|null): TelemetryMetadataByLe
       ...(client ? client.getFullTelemetryMeta() : {}),   // Client if present will repeat and add to user info.
     },
   };
+}
+
+export interface ArchiveUploadResult {
+  added: number;
+  errored: number;
+  unused: number;
+}
+
+export function attachmentToArchiveFilePath(fileDetails: { fileIdent: string, fileName: string } ): string {
+  const fileIdentParts = fileDetails.fileIdent.split(".");
+  const fileHash = fileIdentParts[0];
+  const fileIdentExt = path.extname(fileDetails.fileIdent);
+  const fileNameExt = path.extname(fileDetails.fileName);
+  const fileNameNoExt = path.basename(fileDetails.fileName, fileNameExt);
+  // We need to make sure the downloaded attachment's extension matches Grist's internal
+  // file extension, otherwise we can't recreate the file identifier when uploading.
+  // They might not match, as the upload process considers things like mime type when
+  // adding the extension to the file identifier.
+  return `${fileHash}_${fileNameNoExt}${fileIdentExt}`;
+}
+
+export function archiveFilePathToAttachmentIdent(filePath: string): string {
+  const fileName = path.basename(filePath);
+  const fileHash = fileName.split("_")[0];
+  const fileExt = path.extname(fileName);
+  return `${fileHash}${fileExt}`;
 }

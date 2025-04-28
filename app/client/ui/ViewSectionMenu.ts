@@ -71,6 +71,7 @@ export function viewSectionMenu(
          && !use(viewSection.isRaw) // not in raw mode
          && !use(viewSection.isRecordCard)
          && !use(singleVisible) // not in single section
+         && use(viewSection.canExpand)
          ;
   });
 
@@ -149,6 +150,7 @@ export function viewSectionMenu(
       dom.hide(viewSection.isRecordCard),
     ),
     cssMenu(
+      dom.hide(viewSection.hideViewMenu),
       testId('viewLayout'),
       cssDotsIconWrapper(cssIcon('Dots')),
       menu(_ctl => makeViewLayoutMenu(viewSection, isReadonly.get()), {

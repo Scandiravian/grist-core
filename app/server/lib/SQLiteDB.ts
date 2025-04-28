@@ -67,13 +67,15 @@
  * "migrations" array, and modifying create() to create correct new documents.
  */
 
+import {delay} from 'app/common/delay';
 import {ErrorWithCode} from 'app/common/ErrorWithCode';
 import {timeFormat} from 'app/common/timeFormat';
 import {create} from 'app/server/lib/create';
 import * as docUtils from 'app/server/lib/docUtils';
 import log from 'app/server/lib/log';
-import {MinDB, MinDBOptions, MinRunResult, PreparedStatement, ResultRow,
-        SqliteVariant, Statement} from 'app/server/lib/SqliteCommon';
+import {
+  Backup, MinDB, MinDBOptions, MinRunResult, PreparedStatement, ResultRow,
+  SqliteVariant, Statement} from 'app/server/lib/SqliteCommon';
 import {NodeSqliteVariant} from 'app/server/lib/SqliteNode';
 import assert from 'assert';
 import * as fse from 'fs-extra';
@@ -141,6 +143,7 @@ export interface ISQLiteDB {
   execTransaction<T>(callback: () => Promise<T>): Promise<T>;
   runAndGetId(sql: string, ...params: any[]): Promise<number>;
   requestVacuum(): Promise<boolean>;
+  backup?(filename: string): Backup;
 }
 
 /**
@@ -254,12 +257,20 @@ export class SQLiteDB implements ISQLiteDB {
   private _migrationBackupPath: string|null = null;
   private _migrationError: Error|null = null;
   private _needVacuum: boolean = false;
+  private _closed: boolean = false;
 
   private constructor(protected _db: MinDB, private _dbPath: string) {
   }
 
   public async interrupt(): Promise<void> {
     return this._db.interrupt?.();
+  }
+
+  public backup(filename: string): Backup {
+    if (!this._db.backup) {
+      throw new Error('SQLite wrapper does not support backups');
+    }
+    return this._db.backup(filename);
   }
 
   public getOptions(): MinDBOptions|undefined {
@@ -351,8 +362,40 @@ export class SQLiteDB implements ISQLiteDB {
   }
 
   public async close(): Promise<void> {
-    await this._db.close();
-    SQLiteDB._addOpens(this._dbPath, -1);
+    const alreadyClosed = this._closed;
+    this._closed = true;
+    if (!alreadyClosed) {
+      let tries: number = 0;
+      // We might not be able to close immediately if a backup is in
+      // progress. We will retry for about 10 seconds. Worst case is
+      // if a backup was in progress and is right at the last step of
+      // the backup and a lot of edits were made while the previous
+      // steps were in progress.
+      while (tries < 100) {
+        tries++;
+        try {
+          await this._db.close();
+          break;
+        } catch (e) {
+          if (String(e).match(/SQLITE_BUSY: unable to close due to unfinalized statements or unfinished backups/)) {
+            // Try again! now that this._closed is set, any pending backup should stop.
+            // It will stop quickly if in the middle of a backup, or more slowly if on
+            // the last step.
+            if (tries % 10 === 1) {
+              log.debug("SQLiteDB[%s]: waiting to close", this._dbPath);
+            }
+            await delay(100);
+          } else {
+            throw e;
+          }
+        }
+      }
+      SQLiteDB._addOpens(this._dbPath, -1);
+    }
+  }
+
+  public isClosed(): boolean {
+    return this._closed;
   }
 
   /**

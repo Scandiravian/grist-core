@@ -5,10 +5,11 @@ import {encodeQueryParams, isAffirmative, removePrefix} from 'app/common/gutil';
 import {LocalPlugin} from 'app/common/plugin';
 import {StringUnion} from 'app/common/StringUnion';
 import {TelemetryLevel} from 'app/common/Telemetry';
-import {ThemeAppearance, ThemeAppearanceChecker, ThemeName, ThemeNameChecker} from 'app/common/ThemePrefs';
+import {ThemeAppearance, themeAppearances, ThemeName, themeNames} from 'app/common/ThemePrefs';
 import {getGristConfig} from 'app/common/urlUtils';
 import {Document} from 'app/common/UserAPI';
 import {IAttachedCustomWidget} from "app/common/widgetTypes";
+import {Features as PlanFeatures} from 'app/common/Features';
 import {UIRowId} from 'app/plugin/GristAPI';
 import clone = require('lodash/clone');
 import pickBy = require('lodash/pickBy');
@@ -49,8 +50,11 @@ export type AuditLogsPage = typeof AuditLogsPage.type;
 export const LoginPage = StringUnion('signup', 'login', 'verified', 'forgot-password');
 export type LoginPage = typeof LoginPage.type;
 
-export const AdminPanelPage = StringUnion('admin');
+export const AdminPanelPage = StringUnion('admin', 'docs', 'users', 'workspaces', 'orgs');
 export type AdminPanelPage = typeof AdminPanelPage.type;
+
+export const AdminPanelTab = StringUnion('users', 'workspaces', 'docs', 'orgs', 'details');
+export type AdminPanelTab = typeof AdminPanelTab.type;
 
 // Overall UI style.  "full" is normal, "singlePage" is a single page focused, panels hidden experience.
 export const InterfaceStyle = StringUnion('singlePage', 'full');
@@ -97,9 +101,12 @@ export const commonUrls = {
   helpFilteringReferenceChoices: "https://support.getgrist.com/col-refs/#filtering-reference-choices-in-dropdown",
   helpSandboxing: "https://support.getgrist.com/self-managed/#how-do-i-sandbox-documents",
   helpAPI: 'https://support.getgrist.com/api',
+  helpSummaryFormulas: 'https://support.getgrist.com/summary-tables/#summary-formulas',
+  helpAdminControls: "https://support.getgrist.com/admin-controls",
   freeCoachingCall: getFreeCoachingCallUrl(),
   contactSupport: getContactSupportUrl(),
   termsOfService: getTermsOfServiceUrl(),
+  onboardingTutorialVideoId: getOnboardingVideoId(),
   plans: "https://www.getgrist.com/pricing",
   contact: "https://www.getgrist.com/contact",
   templates: 'https://www.getgrist.com/templates',
@@ -117,9 +124,9 @@ export const commonUrls = {
   githubSponsorGristLabs: 'https://github.com/sponsors/gristlabs',
 
   versionCheck: 'https://api.getgrist.com/api/version',
+  attachmentStorage: 'https://support.getgrist.com/document-settings/#external-attachments',
 };
 
-export const ONBOARDING_VIDEO_YOUTUBE_EMBED_ID = '56AieR9rpww';
 
 /**
  * Values representable in a URL. The current state is available as urlState().state observable
@@ -142,6 +149,7 @@ export interface IGristUrlState {
   login?: LoginPage;
   welcome?: WelcomePage;
   adminPanel?: AdminPanelPage;
+  adminPanelTab?: AdminPanelTab;
   welcomeTour?: boolean;
   docTour?: boolean;
   manageUsers?: boolean;
@@ -161,6 +169,7 @@ export interface IGristUrlState {
     themeSyncWithOs?: boolean;
     themeAppearance?: ThemeAppearance;
     themeName?: ThemeName;
+    details?: boolean; // Used on admin pages to show details tab.
   };
   hash?: HashLink;   // if present, this specifies an individual row within a section of a page.
   api?: boolean;     // indicates that the URL should be encoded as an API URL, not as a landing page.
@@ -346,11 +355,16 @@ export function encodeUrl(gristConfig: Partial<GristLoadConfig>,
     parts.push(`welcome/${state.welcome}`);
   }
 
-  if (state.adminPanel) { parts.push(state.adminPanel); }
+  if (state.adminPanel) {
+    parts.push(state.adminPanel === 'admin' ? 'admin' : `admin/${state.adminPanel}`);
+  }
 
   const queryParams = pickBy(state.params, (v, k) => k !== 'linkParameters') as {[key: string]: string};
   for (const [k, v] of Object.entries(state.params?.linkParameters || {})) {
     queryParams[`${k}_`] = v;
+  }
+  if (state.params?.details) {
+    queryParams.details = 'true';
   }
   const hashParts: string[] = [];
   if (state.hash && (state.hash.rowId || state.hash.popup || state.hash.recordCard)) {
@@ -394,6 +408,8 @@ export function encodeUrl(gristConfig: Partial<GristLoadConfig>,
     url.hash = 'create-team';
   } else if (state.upgradeTeam) {
     url.hash = 'upgrade-team';
+  } else if (state.adminPanelTab) {
+    url.hash = state.adminPanelTab;
   } else {
     url.hash = '';
   }
@@ -497,13 +513,14 @@ export function decodeUrl(gristConfig: Partial<GristLoadConfig>, location: Locat
     state.auditLogs = AuditLogsPage.parse(map.get('audit-logs')) || 'audit-logs';
   }
   if (map.has('welcome')) { state.welcome = WelcomePage.parse(map.get('welcome')); }
-  if (map.has('admin')) { state.adminPanel = AdminPanelPage.parse(map.get('admin')) || 'admin'; }
+  if (map.has('admin')) {
+    state.adminPanel = AdminPanelPage.parse(map.get('admin')) || 'admin';
+  }
   if (sp.has('planType')) { state.params!.planType = sp.get('planType')!; }
   if (sp.has('billingPlan')) { state.params!.billingPlan = sp.get('billingPlan')!; }
   if (sp.has('billingTask')) {
     state.params!.billingTask = BillingTask.parse(sp.get('billingTask'));
   }
-
   if (map.has('signup')) {
     state.login = 'signup';
   } else if (map.has('login')) {
@@ -542,16 +559,20 @@ export function decodeUrl(gristConfig: Partial<GristLoadConfig>, location: Locat
 
   if (sp.has('themeAppearance')) {
     const appearance = sp.get('themeAppearance');
-    if (ThemeAppearanceChecker.strictTest(appearance)) {
-      state.params!.themeAppearance = appearance;
+    if (appearance && themeAppearances.includes(appearance as ThemeAppearance)) {
+      state.params!.themeAppearance = appearance as ThemeAppearance;
     }
   }
 
   if (sp.has('themeName')) {
     const themeName = sp.get('themeName');
-    if (ThemeNameChecker.strictTest(themeName)) {
-      state.params!.themeName = themeName;
+    if (themeName && themeNames.includes(themeName as ThemeName)) {
+      state.params!.themeName = themeName as ThemeName;
     }
+  }
+
+  if (sp.has('details')) {
+    state.params!.details = isAffirmative(sp.get('details'));
   }
 
   if (sp.has('compare')) {
@@ -575,6 +596,7 @@ export function decodeUrl(gristConfig: Partial<GristLoadConfig>, location: Locat
       }
     }
     state.homePageTab = HomePageTab.parse(hashMap.get('#'));
+    state.adminPanelTab = AdminPanelTab.parse(hashMap.get('#'));
     if (hashMap.has('#') && ['a1', 'a2', 'a3'].includes(hashMap.get('#') || '')) {
       const link: HashLink = {};
       const keys = [
@@ -688,6 +710,38 @@ export function parseSubdomainStrictly(host: string|undefined): {org?: string, b
   return {};
 }
 
+
+/**
+ * For a packaged version of Grist that requires activation, this
+ * summarizes the current state. Not applicable to grist-core.
+ * This is the thing that is send via sendAppPage (so this is embedded in HTML).
+ */
+export interface ActivationState {
+  installationId: string;    // Unique identifier for this installation.
+  key?: {                    // Set when Grist is activated.
+    expirationDate?: string; // ISO8601 date that Grist will need reactivation.
+    daysLeft?: number;       // Number of days until Grist will need reactivation.
+  },
+  trial?: {                  // Present when installation has not yet been activated.
+    days: number;            // Max number of days allowed prior to activation.
+    expirationDate: string;  // ISO8601 date that Grist will get cranky.
+    daysLeft: number;        // Number of days left until Grist will get cranky.
+  },
+  needKey?: boolean;         // Set when Grist is cranky and demanding activation.
+  error?: string;            // Present when there is an error reading the key.
+  features?: PlanFeatures;   // Features available in this installation.
+  current?: Partial<PlanFeatures>; // Usage of features in this installation.
+  grace?: {
+    daysLeft: number;       // Number of days left in grace period.
+    graceStarted: string;   // ISO8601 date when grace period started.
+  }
+}
+
+export interface LatestVersionAvailable {
+  version: string;
+  isNewer: boolean;
+}
+
 /**
  * These settings get sent to the client along with the loaded page. At the minimum, the browser
  * needs to know the URL of the home API server (e.g. api.getgrist.com).
@@ -702,6 +756,10 @@ export interface GristLoadConfig {
   // Org or "subdomain". When present, this overrides org information from the hostname. We rely
   // on this for custom domains, but set it generally for all pages.
   org?: string;
+
+  // Makes the Grist frontend access the Grist instance using its current URL in the browser, rather than APP_HOME_URL.
+  // Used to simplify setup of single-domain (no subdomain / doc worker) installations.
+  serveSameOrigin?: boolean;
 
   // Base domain for constructing new URLs, should start with "." and not include port, e.g.
   // ".getgrist.com". It should be unset for localhost operation and in single-org mode.
@@ -793,6 +851,8 @@ export interface GristLoadConfig {
 
   activation?: ActivationState;
 
+  latestVersionAvailable?: LatestVersionAvailable;
+
   // List of enabled features.
   features?: IFeature[];
 
@@ -841,6 +901,9 @@ export interface GristLoadConfig {
   // The doc id of the tutorial shown during onboarding.
   onboardingTutorialDocId?: string;
 
+  // The id of the Youtube video to show for the onboarding
+  onboardingTutorialVideoId?: string;
+
   // Whether to show the "Delete Account" button in the account page.
   canCloseAccount?: boolean;
 
@@ -848,6 +911,9 @@ export interface GristLoadConfig {
 
   // If backend has an email service for sending notifications.
   notifierEnabled?: boolean;
+
+  // Set on /admin pages only, when AdminControls are available and should be enabled in UI.
+  adminControls?: boolean;
 }
 
 export const Features = StringUnion(
@@ -878,22 +944,6 @@ export interface TelemetryConfig {
 export const GristDeploymentTypes = StringUnion('saas', 'core', 'enterprise', 'electron', 'static');
 export type GristDeploymentType = typeof GristDeploymentTypes.type;
 
-/**
- * For a packaged version of Grist that requires activation, this
- * summarizes the current state. Not applicable to grist-core.
- */
-export interface ActivationState {
-  trial?: {                  // Present when installation has not yet been activated.
-    days: number;            // Max number of days allowed prior to activation.
-    expirationDate: string;  // ISO8601 date that Grist will get cranky.
-    daysLeft: number;        // Number of days left until Grist will get cranky.
-  }
-  needKey?: boolean;         // Set when Grist is cranky and demanding activation.
-  key?: {                    // Set when Grist is activated.
-    expirationDate?: string; // ISO8601 date that Grist will need reactivation.
-    daysLeft?: number;       // Number of days until Grist will need reactivation.
-  }
-}
 
 // Acceptable org subdomains are alphanumeric (hyphen also allowed) and of
 // non-zero length.
@@ -934,6 +984,16 @@ export function getHelpCenterUrl(): string {
     return gristConfig && gristConfig.helpCenterUrl || defaultUrl;
   } else {
     return process.env.GRIST_HELP_CENTER || defaultUrl;
+  }
+}
+
+export function getOnboardingVideoId(): string {
+  const defaultId = "56AieR9rpww";
+  if (isClient()) {
+    const gristConfig: GristLoadConfig = (window as any).gristConfig;
+    return gristConfig && gristConfig.onboardingTutorialVideoId || defaultId;
+  } else {
+    return process.env.GRIST_ONBOARDING_VIDEO_ID || defaultId;
   }
 }
 

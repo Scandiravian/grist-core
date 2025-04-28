@@ -3,7 +3,8 @@ import {get as getBrowserGlobals} from 'app/client/lib/browserGlobals';
 import type {KoArray} from 'app/client/lib/koArray';
 import {simpleStringHash} from 'app/client/lib/textUtils';
 import type {ViewFieldRec} from 'app/client/models/DocModel';
-import type {BulkUpdateRecord} from 'app/common/DocActions';
+import TableModel from 'app/client/models/TableModel';
+import type {BulkColValues, BulkUpdateRecord} from 'app/common/DocActions';
 import {safeJsonParse} from 'app/common/gutil';
 import type {TableData} from 'app/common/TableData';
 import {tsvEncode} from 'app/common/tsvFormat';
@@ -46,9 +47,10 @@ export function makePasteText(tableData: TableData, selection: CopySelection, in
  * Hash of the current docId to allow checking if copying and pasting is happening in the same document,
  * without leaking the actual docId which may allow others to access the document.
  */
-export function getDocIdHash(): string {
-  const docId = (window as any).gristDocPageModel.currentDocId.get();
-  return simpleStringHash(docId);
+export function getDocIdHash(): string|undefined {
+  // We might not have global gristDocPageModel (e.g. for virtual tables).
+  const docId: string|undefined = (window as any).gristDocPageModel?.currentDocId.get();
+  return docId && simpleStringHash(docId);
 }
 
 /**
@@ -56,15 +58,15 @@ export function getDocIdHash(): string {
  * the given rows and columns, styled by the given table/row/col style dictionaries.
  * @param {TableData} tableData - the table containing the values denoted by the grid selection
  * @param {CopySelection} selection - a CopySelection instance
- * @param {Boolean} showColHeader - whether to include a column header row
+ * @param {Boolean} includeColHeaders - whether to include a column header row
  * @return {String} The html for a table containing the given data.
  **/
-export function makePasteHtml(tableData: TableData, selection: CopySelection, includeColHeaders: boolean) {
+export function makePasteHtml(tableData: TableData, selection: CopySelection, includeColHeaders: boolean): string {
   const rowStyle = selection.rowStyle || {};    // Maps rowId to style object.
   const colStyle = selection.colStyle || {};    // Maps colId to style object.
 
   const elem = dom('table',
-    {border: '1', cellspacing: '0', style: 'white-space: pre', 'data-grist-doc-id-hash': getDocIdHash()},
+    {border: '1', cellspacing: '0', style: 'white-space: pre', 'data-grist-doc-id-hash': getDocIdHash() || ''},
     dom('colgroup', selection.colIds.map((colId, idx) =>
       dom('col', {
         style: _styleAttr(colStyle[colId]),
@@ -171,4 +173,26 @@ export function makeDeleteAction(selection: CopySelection): BulkUpdateRecord|nul
   }
   return ['BulkUpdateRecord', tableId, rowIds,
     zipObject(colIds, colIds.map(() => blankRow))];
+}
+
+
+/**
+ * Fills currently selected grid with the contents of the top row in that selection.
+ */
+export function fillSelectionDown(selection: CopySelection, tableModel: TableModel) {
+  const rowIds = selection.rowIds.filter((r): r is number => (typeof r === 'number'));
+  if (rowIds.length <= 1) {
+    return;
+  }
+  const nonFormulaColumns = selection.fields.map(f => f.column.peek()).filter(col => !col.isFormula.peek());
+  if (nonFormulaColumns.length === 0) {
+    return;
+  }
+  const colInfo: BulkColValues = {};
+  for (const col of nonFormulaColumns) {
+    const colId = col.colId.peek();
+    const val = tableModel.tableData.getValue(rowIds[0], colId)!;
+    colInfo[colId] = rowIds.map(() => val);
+  }
+  return tableModel.sendTableAction(["BulkUpdateRecord", rowIds, colInfo]);
 }

@@ -1,7 +1,7 @@
 import {ApiError} from 'app/common/ApiError';
 import {InactivityTimer} from 'app/common/InactivityTimer';
 import {FetchUrlOptions, FileUploadResult, UPLOAD_URL_PATH, UploadResult} from 'app/common/uploads';
-import {getUrlFromPrefix} from 'app/common/UserAPI';
+import {DocAttachmentsLocation, getUrlFromPrefix} from 'app/common/UserAPI';
 import {getAuthorizedUserId, getTransitiveHeaders, getUserId, isSingleUserMode,
         RequestWithLogin} from 'app/server/lib/Authorizer';
 import {expressWrap} from 'app/server/lib/expressWrap';
@@ -12,6 +12,7 @@ import log from 'app/server/lib/log';
 import {optStringParam} from 'app/server/lib/requestUtils';
 import {isPathWithin} from 'app/server/lib/serverUtils';
 import * as shutdown from 'app/server/lib/shutdown';
+import {drainWhenSettled} from 'app/server/utils/streams';
 import {fromCallback} from 'bluebird';
 import * as contentDisposition from 'content-disposition';
 import {Application, Request, RequestHandler, Response} from 'express';
@@ -19,6 +20,7 @@ import * as fse from 'fs-extra';
 import pick = require('lodash/pick');
 import * as multiparty from 'multiparty';
 import fetch, {Response as FetchResponse} from 'node-fetch';
+import stream from 'node:stream';
 import * as path from 'path';
 import * as tmp from 'tmp';
 import {IDocWorkerMap} from './DocWorkerMap';
@@ -114,6 +116,80 @@ export async function handleUpload(req: Request, res: Response): Promise<UploadR
   const {upload} = await handleOptionalUpload(req, res);
   if (!upload) { throw new ApiError('missing payload', 400); }
   return upload;
+}
+
+export interface MultipartFormFile {
+  name: string;
+  contentType: string;
+  stream: stream.Readable;
+}
+
+/**
+ * Processes a request containing a multipart/form-data body.
+ * @param {e.Request} req - Request to read body from
+ * @param {(file: MultipartFormFile) => Promise<void>} onFile
+ *  Called for each file found. The returned promise should only resolve
+ *  when the handler is finished with the data stream, otherwise errors might occur.
+ * @param {(name: string, value: string) => void} onField
+ *  Called for each field found.
+ * @returns {Promise<void>}
+ *  Promise, resolves when all parts of the form have been handled, or an error has occurred.
+ */
+export async function parseMultipartFormRequest(
+  req: Request,
+  onFile: (file: MultipartFormFile) => Promise<void> = () => Promise.resolve(),
+  onField: (name: string, value: string) => void = () => {},
+): Promise<void> {
+  let resolveFinished: (() => void) = () => {};
+  let rejectFinished: ((reason: any) => void) = () => {};
+  const finished = new Promise<void>((resolve, reject) => {
+    resolveFinished = resolve;
+    rejectFinished = reject;
+  });
+  const form = new multiparty.Form({ autoField: true });
+  const partPromises: Promise<void>[] = [];
+  // This only emits files, due to autoField being true
+  form.on('part', (part: any) => {
+    // If the underlying stream breaks, we should unblock the caller.
+    part.on('error', (err: any) => rejectFinished(err));
+
+    const filename = part.filename;
+    const contentType = part.headers['content-type'];
+    const contentStream = part;
+
+    if (!(contentStream instanceof stream.Readable)) {
+      // This should never happen in practice, but checking this gives us full type safety, despite
+      // the multiparty library not being typed.
+      throw new Error("File contents is not a readable stream");
+    }
+
+    // The stream needs to be drained for the request to continue. If something goes wrong
+    // in the `onFile` callback, drainWhenSettled guarantees that.
+    partPromises.push(drainWhenSettled(part,
+      onFile({
+        name: (typeof filename == 'string') ? filename : "",
+        contentType: (typeof contentType == 'string') ? contentType : "",
+        stream: contentStream,
+      })
+    // No sensible way to handle errors from this promise - so do nothing here, and assume the callback
+    // handles errors sensibly.
+    ).catch(() => {}));
+  });
+  form.on('field', onField);
+  form.on('error', function (err: any) {
+    rejectFinished(err);
+  });
+  form.on('close', function () {
+    resolveFinished();
+  });
+  form.parse(req);
+  try {
+    await finished;
+  } finally {
+    // Waiting for all part handlers to settle makes using this function more intuitive.
+    // Need to wait for the parsing to be finished first, to ensure all part exist.
+    await Promise.allSettled(partPromises);
+  }
 }
 
 /**
@@ -353,8 +429,8 @@ export async function fetchURL(url: string, accessId: string|null, options?: Fet
 }
 
 /**
- * Register a new upload with resource fetched from a url, optionally including credentials in request.
- * Returns corresponding UploadInfo.
+ * Register a new upload with resource fetched from a url, optionally including credentials in
+ * request. Returns corresponding UploadInfo.
  */
 async function _fetchURL(url: string, accessId: string|null, options?: FetchUrlOptions): Promise<UploadResult> {
   try {
@@ -426,9 +502,31 @@ export async function fetchDoc(
   // The backend needs to be well configured for this to work.
   const { selfPrefix, docWorker } = await getDocWorkerInfoOrSelfPrefix(docId, docWorkerMap, server.getTag());
   const docWorkerUrl = docWorker ? docWorker.internalUrl : getUrlFromPrefix(server.getHomeInternalUrl(), selfPrefix);
+  const apiBaseUrl = docWorkerUrl.replace(/\/*$/, '/');
+
+  // Documents with external attachments can't be copied right now. Check status and alert the user.
+  // Copying as a template is fine, as no attachments will be copied.
+  if (!template) {
+    const transferStatusResponse = await fetch(
+      new URL(`api/docs/${docId}/attachments/transferStatus`, apiBaseUrl).href,
+      {
+        headers: {
+          ...headers,
+          'Content-Type': 'application/json',
+        }
+      }
+    );
+    if (!transferStatusResponse.ok) {
+      throw new ApiError(await transferStatusResponse.text(), transferStatusResponse.status);
+    }
+    const attachmentsLocation: DocAttachmentsLocation = (await transferStatusResponse.json()).locationSummary;
+    if (attachmentsLocation !== 'internal' && attachmentsLocation !== 'none') {
+      throw new ApiError("Cannot copy a document with external attachments", 400);
+    }
+  }
+
   // Download the document, in full or as a template.
-  const url = new URL(`api/docs/${docId}/download?template=${Number(template)}`,
-                      docWorkerUrl.replace(/\/*$/, '/'));
+  const url = new URL(`api/docs/${docId}/download?template=${Number(template)}`, apiBaseUrl);
   return _fetchURL(url.href, accessId, {headers});
 }
 

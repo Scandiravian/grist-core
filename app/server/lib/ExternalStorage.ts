@@ -11,6 +11,16 @@ import stream from 'node:stream';
 // checksum is expected otherwise.
 export const DELETED_TOKEN = '*DELETED*';
 
+export interface FileMetadata {
+  size: number;
+  snapshotId: string;
+}
+
+export interface StreamDownloadResult {
+  metadata: FileMetadata,
+  contentStream: stream.Readable,
+}
+
 /**
  * An external store for the content of files.  The store may be either consistent
  * or eventually consistent.  Specifically, the `exists`, `download`, and `versions`
@@ -57,11 +67,13 @@ export interface ExternalStorage {
 
   // Close the storage object.
   close(): Promise<void>;
-}
 
-export interface StreamingExternalStorage extends ExternalStorage {
-  uploadStream(key: string, inStream: stream.Readable, metadata?: ObjMetadata): Promise<string|null|typeof Unchanged>;
-  downloadStream(key: string, outStream: stream.Writable, snapshotId?: string ): Promise<string>;
+  uploadStream?(key: string,
+                inStream: stream.Readable,
+                size?: number,
+                metadata?: ObjMetadata
+  ): Promise<string|null|typeof Unchanged>;
+  downloadStream?(key: string, snapshotId?: string ): Promise<StreamDownloadResult>;
 }
 
 /**
@@ -69,8 +81,27 @@ export interface StreamingExternalStorage extends ExternalStorage {
  * E.g. this could convert "<docId>" to "v1/<docId>.grist"
  */
 export class KeyMappedExternalStorage implements ExternalStorage {
+  public uploadStream: ExternalStorage['uploadStream'];
+  public downloadStream: ExternalStorage['downloadStream'];
+  public removeAllWithPrefix: ExternalStorage['removeAllWithPrefix'];
+
   constructor(private _ext: ExternalStorage,
               private _map: (key: string) => string) {
+    if (_ext.uploadStream !== undefined) {
+      const extUploadStream = _ext.uploadStream;
+      this.uploadStream =
+        (key, inStream, size, metadata) => extUploadStream.call(_ext, this._map(key), inStream, size, metadata);
+    }
+    if (_ext.downloadStream !== undefined) {
+      const extDownloadStream = _ext.downloadStream;
+      this.downloadStream =
+        (key, snapshotId) => extDownloadStream.call(_ext, this._map(key), snapshotId);
+    }
+    if (_ext.removeAllWithPrefix !== undefined) {
+      const extRemoveAllWithPrefix = _ext.removeAllWithPrefix;
+      this.removeAllWithPrefix =
+        (prefix) => extRemoveAllWithPrefix.call(_ext, this._map(prefix));
+    }
   }
 
   public exists(key: string, snapshotId?: string): Promise<boolean> {
@@ -146,9 +177,9 @@ export class ChecksummedExternalStorage implements ExternalStorage {
   constructor(public readonly label: string, private _ext: ExternalStorage, private _options: {
     maxRetries: number,         // how many time to retry inconsistent downloads
     initialDelayMs: number,     // how long to wait before retrying
-    localHash: PropStorage,     // key/value store for hashes of downloaded content
-    sharedHash: PropStorage,    // key/value store for hashes of external content
-    latestVersion: PropStorage, // key/value store for snapshotIds of uploads
+    localHash: PropStorage,     // key/value store for hashes of downloaded content (file {Id}.grist-hash-{meta/doc})
+    sharedHash: PropStorage,    // key/value store for hashes of external content (typically Redis)
+    latestVersion: PropStorage, // key/value store for snapshotIds of uploads (a JS map object)
     computeFileHash: (fname: string) => Promise<string>,  // compute hash for file
   }) {
   }
@@ -165,7 +196,9 @@ export class ChecksummedExternalStorage implements ExternalStorage {
 
   public async upload(key: string, fname: string, metadata?: ObjMetadata) {
     try {
+      // This is the hash computed from the local version of the file
       const checksum = await this._options.computeFileHash(fname);
+      // This is the hash stored locally in persist/grist/docs/{docId}.grist-hash-{meta/doc}
       const prevChecksum = await this._options.localHash.load(key);
       if (prevChecksum && prevChecksum === checksum && !metadata?.label) {
         // nothing to do, checksums match
@@ -228,8 +261,11 @@ export class ChecksummedExternalStorage implements ExternalStorage {
       const tmpPath = path.join(tmpDir, `${toKey}-tmp`);  // NOTE: assumes key is file-system safe.
       try {
         const downloadedSnapshotId = await this._ext.download(fromKey, tmpPath, snapshotId);
-
         const checksum = await this._options.computeFileHash(tmpPath);
+        log.info("ext %s download: %s%s%s with checksum %s and version %s saved to %s", this.label, fromKey,
+          snapshotId ? ` [VersionId ${snapshotId}]` : '',
+          fromKey !== toKey ? ` as ${toKey}` : '',
+          checksum, downloadedSnapshotId, tmpPath);
 
         // Check for consistency if mutable data fetched.
         if (!snapshotId) {
@@ -249,9 +285,10 @@ export class ChecksummedExternalStorage implements ExternalStorage {
           }
         }
 
-        // If successful, rename the temporary file to its proper name. The destination should NOT
+        // Rename the temporary file to its proper name. The destination should NOT
         // exist in this case, and this should fail if it does.
         await fse.move(tmpPath, fname, {overwrite: false});
+        log.info("ext %s download: %s renamed from %s to %s", this.label, fromKey, tmpPath, fname);
         if (fromKey === toKey) {
           // Save last S3 snapshot id observed for this key.
           await this._options.latestVersion.save(toKey, downloadedSnapshotId);
@@ -259,11 +296,6 @@ export class ChecksummedExternalStorage implements ExternalStorage {
           // locally we can skip pushing it back needlessly later).
           await this._options.localHash.save(toKey, checksum);
         }
-
-        log.info("ext %s download: %s%s%s with checksum %s and version %s", this.label, fromKey,
-                 snapshotId ? ` [VersionId ${snapshotId}]` : '',
-                 fromKey !== toKey ? ` as ${toKey}` : '',
-                 checksum, downloadedSnapshotId);
 
         return downloadedSnapshotId;
       } catch (err) {
@@ -320,7 +352,10 @@ export class ChecksummedExternalStorage implements ExternalStorage {
     const start = Date.now();
     while (backoffCount <= this._options.maxRetries) {
       try {
+        const attemptStart = Date.now();
         const result = await operation();
+        const [attemptMs, totalMs] = [Date.now() - attemptStart, Date.now() - start];
+        log.info(`operation ${name} took ${attemptMs} ms (attempt: ${backoffCount}, total: ${totalMs} ms)`);
         if (result !== undefined) { return result; }
         problems.push([Date.now() - start, 'not ready']);
       } catch (err) {
@@ -381,7 +416,7 @@ export interface PropStorage {
 export const Unchanged = Symbol('Unchanged');
 
 export interface ExternalStorageSettings {
-  purpose: 'doc' | 'meta';
+  purpose: 'doc' | 'meta' | 'attachments';
   basePrefix?: string;
   extraPrefix?: string;
 }
@@ -394,6 +429,12 @@ export interface ExternalStorageSettings {
 */
 export type ExternalStorageCreator =
   (purpose: ExternalStorageSettings["purpose"], extraPrefix: string) => ExternalStorage | undefined;
+
+export class UnsupportedPurposeError extends Error {
+  constructor(purpose: ExternalStorageSettings["purpose"]) {
+    super(`create.ExternalStorage: unsupported purpose '${purpose}'`);
+  }
+}
 
 function stripTrailingSlash(text: string): string {
   return text.endsWith("/") ? text.slice(0, -1) : text;
@@ -420,7 +461,7 @@ export function joinKeySegments(keySegments: string[]): string {
  * The storage mapping we use for our SaaS. A reasonable default, but relies
  * on appropriate lifecycle rules being set up in the bucket.
  */
-export function getExternalStorageKeyMap(settings: ExternalStorageSettings): (docId: string) => string {
+export function getExternalStorageKeyMap(settings: ExternalStorageSettings): (originalKey: string) => string {
   const {basePrefix, extraPrefix, purpose} = settings;
   let fullPrefix = basePrefix + (basePrefix?.endsWith('/') ? '' : '/');
   if (extraPrefix) {
@@ -428,17 +469,20 @@ export function getExternalStorageKeyMap(settings: ExternalStorageSettings): (do
   }
 
   // Set up how we name files/objects externally.
-  let fileNaming: (docId: string) => string;
+  let fileNaming: (originalKey: string) => string;
   if (purpose === 'doc') {
     fileNaming = docId => `${docId}.grist`;
   } else if (purpose === 'meta') {
     // Put this in separate prefix so a lifecycle rule can prune old versions of the file.
     // Alternatively, could go in separate bucket.
     fileNaming = docId => `assets/unversioned/${docId}/meta.json`;
+  } else if (purpose === 'attachments') {
+    // Prefix-only - attachments system handles exact naming
+    fileNaming = attachmentPath => `attachments/${stripLeadingSlash(attachmentPath)}`;
   } else {
-    throw new Error('create.ExternalStorage: unrecognized purpose');
+    throw new UnsupportedPurposeError(settings.purpose);
   }
-  return docId => (fullPrefix + fileNaming(docId));
+  return originalKey => (fullPrefix + fileNaming(originalKey));
 }
 
 export function wrapWithKeyMappedStorage(rawStorage: ExternalStorage, settings: ExternalStorageSettings) {

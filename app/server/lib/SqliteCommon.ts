@@ -56,6 +56,8 @@ export interface MinDB {
    * Get some facts about the wrapper.
    */
   getOptions?(): MinDBOptions;
+
+  backup?(filename: string): Backup;
 }
 
 export interface MinRunResult {
@@ -75,6 +77,14 @@ export interface PreparedStatement {
 
 export interface SqliteVariant {
   opener(dbPath: string, mode: OpenMode): Promise<MinDB>;
+}
+
+export interface Backup {
+  remaining: number;
+  failed: boolean;
+  step(pages: number,
+       callback?: (err: Error | null) => void): void;
+  finish(callback?: (err: Error | null) => void): void;
 }
 
 /**

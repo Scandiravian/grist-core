@@ -21,9 +21,6 @@ declare module "bluebird" {
 // Used in one place, and the typings are almost entirely unhelpful.
 declare module "multiparty";
 
-// Used in one place, for one call.
-declare module "chokidar";
-
 // Used in one place
 declare module "mime-types";
 
@@ -37,12 +34,6 @@ declare module "@gristlabs/express-session";
 // Used for command line path tweaks.
 declare module "app-module-path" {
   export function addPath(path: string): void;
-}
-
-// version of pidusage that has correct ctime on linux
-declare module '@gristlabs/pidusage' {
-  import pidusage from 'pidusage';
-  export default pidusage;
 }
 
 declare module "csv";

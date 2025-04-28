@@ -160,8 +160,12 @@ describe('GranularAccess', function() {
     }
     cliEditor = await getWebsocket(editor);
     cliOwner = await getWebsocket(owner);
-    await cliEditor.openDocOnConnect(docId);
-    await cliOwner.openDocOnConnect(docId);
+    try {
+      await cliEditor.openDocOnConnect(docId);
+      await cliOwner.openDocOnConnect(docId);
+    } catch (_e) {
+      // doc may be unusable
+    }
   }
 
   // Reopen clients in a different mode (e.g. default vs fork), or in a different order
@@ -1096,9 +1100,8 @@ describe('GranularAccess', function() {
 
     // Can still change rules.
     await owner.applyUserActions(docId, [
-      ['AddRecord', '_grist_ACLResources', -1, {tableId: '*', colIds: '*'}],
-      ['AddRecord', '_grist_ACLRules', null, {
-        resource: -1, aclFormula: 'True', permissionsText: '+S',
+      ['UpdateRecord', '_grist_ACLRules', 2, {
+        aclFormula: 'True', permissionsText: '+S',
       }],
     ]);
 
@@ -3351,9 +3354,8 @@ describe('GranularAccess', function() {
       ['AddRecord', 'Users', null, {Email2: 'green@color.com', Name: 'Gary', Access: 'editors'}],
       ['AddRecord', 'Users', null, {Email2: 'blue@color.com', Name: 'Beatrix', Access: 'viewers'}],
       ['AddRecord', 'Users', null, {Email2: 'yellow@color.com', Name: 'Yan', Access: null}],
-      ['AddRecord', '_grist_ACLResources', -1, {tableId: '*', colIds: '*'}],
       ['AddRecord', '_grist_ACLRules', null, {
-        resource: -1, userAttributes: JSON.stringify({
+        resource: 2, userAttributes: JSON.stringify({
           name: 'More',
           tableId: 'Users',
           charId: 'Email',
@@ -4113,6 +4115,18 @@ describe('GranularAccess', function() {
       assert.notEqual(shares[0].doc_id, shares[1].doc_id);
       await removeShares(docId, owner);
       await removeShares(copyDocId, owner);
+    });
+
+    // There was a bug where some access rules were so bad recovery mode
+    // couldn't start.
+    it('can recover from certain bad access rules', async function() {
+      await freshDoc('BadRules.grist');
+      await assert.isRejected(
+        owner.getDocAPI(docId).getRows('Table1'),
+        /Duplicate ACLResource 4: an ACLResource with the same tableId and colIds already exists/
+      );
+      await owner.getDocAPI(docId).recover(true);
+      await assert.isFulfilled(owner.getDocAPI(docId).getRows('Table1'));
     });
   });
 });

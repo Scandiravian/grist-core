@@ -1,14 +1,16 @@
-import { reportError } from 'app/client/models/errors';
-import { GristDoc } from 'app/client/components/GristDoc';
-import { TableData } from 'app/client/models/TableData';
-import { concatenateSummaries, summarizeStoredAndUndo } from 'app/common/ActionSummarizer';
-import { TableDelta } from 'app/common/ActionSummary';
-import { ProcessedAction } from 'app/common/AlternateActions';
-import { DisposableWithEvents } from 'app/common/DisposableWithEvents';
-import { DocAction, TableDataAction, UserAction } from 'app/common/DocActions';
-import { DocDataCache } from 'app/common/DocDataCache';
-import { RowRecord } from 'app/plugin/GristData';
-import debounce = require('lodash/debounce');
+import {DocModel} from 'app/client/models/DocModel';
+import {reportError} from 'app/client/models/errors';
+import {TableData} from 'app/client/models/TableData';
+import {concatenateSummaries, summarizeStoredAndUndo} from 'app/common/ActionSummarizer';
+import {TableDelta} from 'app/common/ActionSummary';
+import {ProcessedAction} from 'app/common/AlternateActions';
+import {DisposableWithEvents} from 'app/common/DisposableWithEvents';
+import {DocAction, TableDataAction, UserAction} from 'app/common/DocActions';
+import {DocDataCache} from 'app/common/DocDataCache';
+import {RowRecord} from 'app/plugin/GristData';
+import * as commands from 'app/client/components/commands';
+import debounce from 'lodash/debounce';
+import {bundleChanges} from 'grainjs';
 
 /**
  * An interface for use while editing a virtual table.
@@ -20,7 +22,7 @@ import debounce = require('lodash/debounce');
  * actions and delta are trivial.
  */
 export interface IEdit {
-  gristDoc: GristDoc,
+  docModel: DocModel,
   actions: ProcessedAction[],  // UserActions plus corresponding DocActions (forward and undo).
   delta: TableDelta,           // A summary of the effect actions would have (or had).
 
@@ -40,14 +42,15 @@ export interface IEdit {
  */
 export interface IExternalTable {
   name: string;  // the tableId of the virtual table (e.g. GristHidden_WebhookTable)
-  initialActions: DocAction[];  // actions to create the table.
-  destroyActions?: DocAction[];  // actions to destroy the table (auto generated if not defined), pass [] to disable.
+  initialActions(): DocAction[];  // actions to create the table.
+  destroyActions?(): DocAction[];  // actions to destroy the table (auto generated if not defined), pass [] to disable.
   fetchAll(): Promise<TableDataAction>;  // get initial state of the table.
-  sync(editor: IEdit): Promise<void>;    // incorporate external changes.
-  beforeEdit(editor: IEdit): Promise<void>;  // called prior to committing a change.
-  afterEdit(editor: IEdit): Promise<void>;   // called after committing a change.
-  afterAnySchemaChange(editor: IEdit): Promise<void>;  // called after any schema change in the document.
+  sync?(editor: IEdit): Promise<void>;    // incorporate external changes.
+  beforeEdit?(editor: IEdit): Promise<void>;  // called prior to committing a change.
+  afterEdit?(editor: IEdit): Promise<void>;   // called after committing a change.
+  afterAnySchemaChange?(editor: IEdit): Promise<void>;  // called after any schema change in the document.
 }
+
 
 // A counter to generate unique actionNums for undo actions.
 let _counterForUndoActions: number = 1;
@@ -58,7 +61,7 @@ let _counterForUndoActions: number = 1;
  */
 export class VirtualTableData extends TableData {
 
-  public gristDoc: GristDoc;
+  public docModel: DocModel;
   public ext: IExternalTable;
   public cache: DocDataCache;
 
@@ -73,7 +76,7 @@ export class VirtualTableData extends TableData {
   public override async sendTableActions(userActions: UserAction[]): Promise<any[]> {
     const actions = await this._sendTableActionsCore(userActions,
                                                      {isUser: true});
-    await this.ext.afterEdit(this._editor(actions));
+    await this.ext.afterEdit?.(this._editor(actions));
     return actions.map(action => action.retValues);
   }
 
@@ -84,7 +87,7 @@ export class VirtualTableData extends TableData {
 
   public setExt(_ext: IExternalTable) {
     this.ext = _ext;
-    this.cache = new DocDataCache(this.ext.initialActions);
+    this.cache = new DocDataCache(this.ext.initialActions());
   }
 
   public getName() {
@@ -92,11 +95,11 @@ export class VirtualTableData extends TableData {
   }
 
   public sync() {
-    return this.ext.sync(this._editor());
+    return this.ext.sync?.(this._editor());
   }
 
   public async schemaChange() {
-    await this.ext.afterAnySchemaChange(this._editor());
+    await this.ext.afterAnySchemaChange?.(this._editor());
   }
 
   private _editor(actions: ProcessedAction[] = []): IEdit {
@@ -107,7 +110,7 @@ export class VirtualTableData extends TableData {
     return {
       actions,
       delta,
-      gristDoc: this.gristDoc,
+      docModel: this.docModel,
       getRecord: rowId => this.getRecord(rowId),
       getRecordNew: rowId => this.getRecord(rowId),
       getRowIds: () => this.getRowIds(),
@@ -132,7 +135,7 @@ export class VirtualTableData extends TableData {
     if (isUser) {
       const newTable = await this.cache.docData.requireTable(this.getName());
       try {
-        await this.ext.beforeEdit({
+        await this.ext.beforeEdit?.({
           ...this._editor(actions),
           getRecordNew: rowId => newTable.getRecord(rowId),
         });
@@ -144,7 +147,6 @@ export class VirtualTableData extends TableData {
         throw e;
       }
     }
-
     for (const action of actions) {
       for (const docAction of action.stored) {
         this.docData.receiveAction(docAction);
@@ -152,7 +154,7 @@ export class VirtualTableData extends TableData {
         if (isUser) {
           const code = `ext-${this.getName()}-${_counterForUndoActions}`;
           _counterForUndoActions++;
-          this.gristDoc.getUndoStack().pushAction({
+          commands.allCommands.pushUndoAction.run({
             actionNum: code,
             actionHash: 'hash',
             fromSelf: true,
@@ -199,37 +201,45 @@ export class VirtualTableRegistration extends DisposableWithEvents {
   });
   private _tableData: VirtualTableData;
 
-  constructor(gristDoc: GristDoc, ext: IExternalTable) {
+  constructor(docModel: DocModel, ext: IExternalTable) {
     super();
-    if (!gristDoc.docModel.docData.getTable(ext.name)) {
-
-      // Register the virtual table
-      gristDoc.docModel.docData.registerVirtualTableFactory(ext.name, VirtualTableData);
-
-      // then process initial actions
-      for (const action of ext.initialActions) {
-        gristDoc.docData.receiveAction(action);
-      }
-      // pass in gristDoc and external interface
-      this._tableData = gristDoc.docModel.docData.getTable(ext.name)! as VirtualTableData;
-      //this.tableData.docApi = this.docApi;
-      this._tableData.gristDoc = gristDoc;
-      this._tableData.setExt(ext);
-
-      // subscribe to schema changes
-      this._tableData.schemaChange().catch(e => reportError(e));
-      this.listenTo(gristDoc, 'schemaUpdateAction', () => this._tableData.schemaChange());
-    } else {
+    const docData = docModel.docData;
+    if (docData.getTable(ext.name)) {
       throw new Error(`Virtual table ${ext.name} already exists`);
     }
+    // Register the virtual table
+    docData.registerVirtualTableFactory(ext.name, VirtualTableData);
+
+    const initialActions = ext.initialActions();
+    // then process initial actions
+    docData.receiveActions(initialActions);
+    // pass in gristDoc and external interface
+    this._tableData = docData.getTable(ext.name)! as VirtualTableData;
+    //this.tableData.docApi = this.docApi;
+    this._tableData.docModel = docModel;
+    this._tableData.setExt(ext);
+    // subscribe to schema changes
+    this._tableData.schemaChange().catch(e => reportError(e));
     // debounce is typed as returning a promise, but doesn't appear to actually //do so?
     Promise.resolve(this.lazySync()).catch(e => reportError(e));
 
     this.onDispose(() => {
-      const reverse = ext.destroyActions ?? generateDestroyActions(ext.initialActions);
-      reverse.forEach(action => gristDoc.docModel.docData.receiveAction(action));
-      gristDoc.docModel.docData.unregisterVirtualTableFactory(ext.name);
+      bundleChanges(() => {
+        const reverse = ext.destroyActions ? ext.destroyActions() : generateDestroyActions(initialActions);
+        reverse.forEach(action => docData.receiveAction(action));
+        docData.unregisterVirtualTableFactory(ext.name);
+      });
     });
+  }
+
+  public listenToEvents(source: DisposableWithEvents) {
+    const listener = () => this._tableData.schemaChange().catch(e => reportError(e));
+    this.listenTo(source, 'schemaUpdateAction', listener);
+    this.onDispose(() => this.stopListening(source, 'schemaUpdateAction', listener));
+  }
+
+  public updateSchema() {
+    return this._tableData.schemaChange();
   }
 
   private async _sync() {

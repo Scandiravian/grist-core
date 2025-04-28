@@ -1,25 +1,27 @@
 import {GristDeploymentType} from 'app/common/gristUrls';
+import {
+  AttachmentStoreCreationError,
+  ExternalStorageAttachmentStore, storageSupportsAttachments
+} from 'app/server/lib/AttachmentStore';
 import {getCoreLoginSystem} from 'app/server/lib/coreLogins';
 import {getThemeBackgroundSnippet} from 'app/common/Themes';
 import {Document} from 'app/gen-server/entity/Document';
 import {HomeDBManager} from 'app/gen-server/lib/homedb/HomeDBManager';
 import {IAttachmentStore} from 'app/server/lib/AttachmentStore';
-import {Comm} from 'app/server/lib/Comm';
 import {DocStorageManager} from 'app/server/lib/DocStorageManager';
-import {IDocWorkerMap} from 'app/server/lib/DocWorkerMap';
-import {ExternalStorage, ExternalStorageCreator} from 'app/server/lib/ExternalStorage';
+import {ExternalStorage, ExternalStorageCreator, UnsupportedPurposeError} from 'app/server/lib/ExternalStorage';
 import {createDummyTelemetry, GristLoginSystem, GristServer} from 'app/server/lib/GristServer';
-import {HostedStorageManager, HostedStorageOptions} from 'app/server/lib/HostedStorageManager';
+import {HostedStorageManager} from 'app/server/lib/HostedStorageManager';
 import {createNullAuditLogger, IAuditLogger} from 'app/server/lib/IAuditLogger';
-import {IBilling} from 'app/server/lib/IBilling';
+import {EmptyBilling, IBilling} from 'app/server/lib/IBilling';
 import {IDocStorageManager} from 'app/server/lib/IDocStorageManager';
 import {EmptyNotifier, INotifier} from 'app/server/lib/INotifier';
 import {InstallAdmin, SimpleInstallAdmin} from 'app/server/lib/InstallAdmin';
 import {ISandbox, ISandboxCreationOptions} from 'app/server/lib/ISandbox';
-import {IShell} from 'app/server/lib/IShell';
 import {createSandbox, SpawnFn} from 'app/server/lib/NSandbox';
 import {SqliteVariant} from 'app/server/lib/SqliteCommon';
 import {ITelemetry} from 'app/server/lib/Telemetry';
+import {Express} from 'express';
 
 // In the past, the session secret was used as an additional
 // protection passed on to expressjs-session for security when
@@ -44,18 +46,6 @@ import {ITelemetry} from 'app/server/lib/Telemetry';
 export const DEFAULT_SESSION_SECRET =
   'Phoo2ag1jaiz6Moo2Iese2xoaphahbai3oNg7diemohlah0ohtae9iengafieS2Hae7quungoCi9iaPh';
 
-export type LocalDocStorageManagerCreator =
-  (docsRoot: string, samplesRoot?: string, comm?: Comm, shell?: IShell) => Promise<IDocStorageManager>;
-export type HostedDocStorageManagerCreator = (
-    docsRoot: string,
-    docWorkerId: string,
-    disableS3: boolean,
-    docWorkerMap: IDocWorkerMap,
-    dbManager: HomeDBManager,
-    createExternalStorage: ExternalStorageCreator,
-    options?: HostedStorageOptions
-  ) => Promise<IDocStorageManager>;
-
 export interface ICreate {
   // Create a space to store files externally, for storing either:
   //  - documents. This store should be versioned, and can be eventually consistent.
@@ -65,15 +55,19 @@ export interface ICreate {
   ExternalStorage: ExternalStorageCreator;
 
   // Creates a IDocStorageManager for storing documents on the local machine.
-  createLocalDocStorageManager: LocalDocStorageManagerCreator;
+  createLocalDocStorageManager(
+    ...args: ConstructorParameters<typeof DocStorageManager>
+  ): Promise<IDocStorageManager>;
+
   // Creates a IDocStorageManager for storing documents on an external storage (e.g S3)
-  createHostedDocStorageManager: HostedDocStorageManagerCreator;
+  createHostedDocStorageManager(
+    ...args: ConstructorParameters<typeof HostedStorageManager>
+  ): Promise<IDocStorageManager>;
 
   Billing(dbManager: HomeDBManager, gristConfig: GristServer): IBilling;
   Notifier(dbManager: HomeDBManager, gristConfig: GristServer): INotifier;
   AuditLogger(dbManager: HomeDBManager, gristConfig: GristServer): IAuditLogger;
   Telemetry(dbManager: HomeDBManager, gristConfig: GristServer): ITelemetry;
-  Shell?(): IShell;  // relevant to electron version of Grist only.
 
   NSandbox(options: ISandboxCreationOptions): ISandbox;
 
@@ -90,11 +84,14 @@ export interface ICreate {
   // static page.
   getExtraHeadHtml?(): string;
   getStorageOptions?(name: string): ICreateStorageOptions|undefined;
-  getAttachmentStoreOptions(): ICreateAttachmentStoreOptions[];
+  getAttachmentStoreOptions(): {[key: string]: ICreateAttachmentStoreOptions | undefined};
   getSqliteVariant?(): SqliteVariant;
   getSandboxVariants?(): Record<string, SpawnFn>;
 
   getLoginSystem(): Promise<GristLoginSystem>;
+
+  addExtraHomeEndpoints(gristServer: GristServer, app: Express): void;
+  areAdminControlsAvailable(): boolean;
 }
 
 export interface ICreateActiveDocOptions {
@@ -108,23 +105,7 @@ export interface ICreateStorageOptions {
   name: string;
   check(): boolean;
   checkBackend?(): Promise<void>;
-  create(purpose: 'doc'|'meta', extraPrefix: string): ExternalStorage|undefined;
-}
-
-export interface ICreateNotifierOptions {
-  create(dbManager: HomeDBManager, gristConfig: GristServer): INotifier|undefined;
-}
-
-export interface ICreateBillingOptions {
-  create(dbManager: HomeDBManager, gristConfig: GristServer): IBilling|undefined;
-}
-
-export interface ICreateAuditLoggerOptions {
-  create(dbManager: HomeDBManager, gristConfig: GristServer): IAuditLogger|undefined;
-}
-
-export interface ICreateTelemetryOptions {
-  create(dbManager: HomeDBManager, gristConfig: GristServer): ITelemetry|undefined;
+  create(purpose: 'doc'|'meta'|'attachments', extraPrefix: string): ExternalStorage|undefined;
 }
 
 export interface ICreateAttachmentStoreOptions {
@@ -134,146 +115,118 @@ export interface ICreateAttachmentStoreOptions {
 }
 
 /**
- * This function returns a `create` object that defines various core
+ * This class provides a `create` object that defines various core
  * aspects of a Grist installation, such as what kind of billing or
  * sandbox to use, if any.
  *
- * The intended use of this function is to initialise Grist with
+ * The intended use of this class is to initialise Grist with
  * different settings and providers, to facilitate different editions
  * such as standard, enterprise or cloud-hosted.
  */
-export function makeSimpleCreator(opts: {
-  deploymentType: GristDeploymentType,
-  sessionSecret?: string,
-  storage?: ICreateStorageOptions[],
-  billing?: ICreateBillingOptions,
-  notifier?: ICreateNotifierOptions,
-  auditLogger?: ICreateAuditLoggerOptions,
-  telemetry?: ICreateTelemetryOptions,
-  sandboxFlavor?: string,
-  shell?: IShell,
-  getExtraHeadHtml?: () => string,
-  getSqliteVariant?: () => SqliteVariant,
-  getSandboxVariants?: () => Record<string, SpawnFn>,
-  createInstallAdmin?: (dbManager: HomeDBManager) => Promise<InstallAdmin>,
-  getLoginSystem?: () => Promise<GristLoginSystem>,
-  createHostedDocStorageManager?: HostedDocStorageManagerCreator,
-  createLocalDocStorageManager?: LocalDocStorageManagerCreator,
-  attachmentStoreOptions?: ICreateAttachmentStoreOptions[],
-}): ICreate {
-  const {deploymentType, sessionSecret, storage, notifier, billing, auditLogger, telemetry} = opts;
-  return {
-    deploymentType() { return deploymentType; },
-    Billing(dbManager, gristConfig) {
-      return billing?.create(dbManager, gristConfig) ?? {
-        addEndpoints() { /* do nothing */ },
-        addEventHandlers() { /* do nothing */ },
-        addWebhooks() { /* do nothing */ },
-        async addMiddleware() { /* do nothing */ },
-        addPages() { /* do nothing */ },
-        getActivationStatus() {
-          return {
-            inGoodStanding: true,
-            isInTrial: false,
-            expirationDate: null,
-          };
+export class BaseCreate implements ICreate {
+  constructor(
+    private readonly _deploymentType: GristDeploymentType,
+    private _storage: ICreateStorageOptions[] = []
+  ) {}
+
+  public deploymentType(): GristDeploymentType { return this._deploymentType; }
+  public Billing(dbManager: HomeDBManager, gristConfig: GristServer): IBilling {
+    return new EmptyBilling();
+  }
+  public Notifier(dbManager: HomeDBManager, gristConfig: GristServer): INotifier {
+    return EmptyNotifier;
+  }
+  public ExternalStorage(...[purpose, extraPrefix]: Parameters<ExternalStorageCreator>): ExternalStorage|undefined {
+    for (const s of this._storage) {
+      if (s.check()) {
+        return s.create(purpose, extraPrefix);
+      }
+    }
+    return undefined;
+  }
+  public AuditLogger(dbManager: HomeDBManager, gristConfig: GristServer) {
+    return createNullAuditLogger();
+  }
+  public Telemetry(dbManager: HomeDBManager, gristConfig: GristServer): ITelemetry {
+    return createDummyTelemetry();
+  }
+  public NSandbox(options: ISandboxCreationOptions): ISandbox {
+    return createSandbox('unsandboxed', options);
+  }
+  public sessionSecret(): string {
+    return process.env.GRIST_SESSION_SECRET || DEFAULT_SESSION_SECRET;
+  }
+  public async configure() {
+    for (const s of this._storage) {
+      if (s.check()) {
+        break;
+      }
+    }
+  }
+  public async checkBackend() {
+    for (const s of this._storage) {
+      if (s.check()) {
+        await s.checkBackend?.();
+        break;
+      }
+    }
+  }
+  public getExtraHeadHtml() {
+    const elements: string[] = [];
+    if (process.env.APP_STATIC_INCLUDE_CUSTOM_CSS === 'true') {
+      elements.push('<link id="grist-custom-css" rel="stylesheet" href="custom.css">');
+    }
+    elements.push(getThemeBackgroundSnippet());
+    return elements.join('\n');
+  }
+  public getStorageOptions(name: string) {
+    return this._storage.find(s => s.name === name);
+  }
+
+  public getAttachmentStoreOptions() {
+    return {
+      // 'snapshots' provider uses the ExternalStorage provider set up for doc snapshots for attachments
+      snapshots: {
+        name: 'snapshots',
+        isAvailable: async () => {
+          try {
+            const storage = this.ExternalStorage('attachments', '');
+            return storage ? storageSupportsAttachments(storage) : false;
+          } catch(e) {
+            if (e instanceof UnsupportedPurposeError) {
+              return false;
+            }
+            throw e;
+          }
         },
-      };
-    },
-    Notifier(dbManager, gristConfig) {
-      return notifier?.create(dbManager, gristConfig) ?? EmptyNotifier;
-    },
-    ExternalStorage(purpose, extraPrefix) {
-      for (const s of storage || []) {
-        if (s.check()) {
-          return s.create(purpose, extraPrefix);
+        create: async (storeId: string) => {
+          const storage = this.ExternalStorage('attachments', '');
+          // This *should* always pass due to the `isAvailable` check above being run earlier.
+          if (!(storage && storageSupportsAttachments(storage))) {
+            throw new AttachmentStoreCreationError('snapshots', storeId,
+                                                   'External storage does not support attachments');
+          }
+          return new ExternalStorageAttachmentStore(
+            storeId,
+            storage,
+          );
         }
       }
-      return undefined;
-    },
-    AuditLogger(dbManager, gristConfig) {
-      return auditLogger?.create(dbManager, gristConfig) ?? createNullAuditLogger();
-    },
-    Telemetry(dbManager, gristConfig) {
-      return telemetry?.create(dbManager, gristConfig) ?? createDummyTelemetry();
-    },
-    NSandbox(options) {
-      return createSandbox(opts.sandboxFlavor || 'unsandboxed', options);
-    },
-    sessionSecret() {
-      return process.env.GRIST_SESSION_SECRET || sessionSecret || DEFAULT_SESSION_SECRET;
-    },
-    async configure() {
-      for (const s of storage || []) {
-        if (s.check()) {
-          break;
-        }
-      }
-    },
-    async checkBackend() {
-      for (const s of storage || []) {
-        if (s.check()) {
-          await s.checkBackend?.();
-          break;
-        }
-      }
-    },
-    ...(opts.shell && {
-      Shell() {
-        return opts.shell as IShell;
-      },
-    }),
-    getExtraHeadHtml() {
-      if (opts.getExtraHeadHtml) {
-        return opts.getExtraHeadHtml();
-      }
-      const elements: string[] = [];
-      if (process.env.APP_STATIC_INCLUDE_CUSTOM_CSS === 'true') {
-        elements.push('<link rel="stylesheet" href="custom.css">');
-      }
-      elements.push(getThemeBackgroundSnippet());
-      return elements.join('\n');
-    },
-    getStorageOptions(name: string) {
-      return storage?.find(s => s.name === name);
-    },
-    getAttachmentStoreOptions(): ICreateAttachmentStoreOptions[] {
-      return opts.attachmentStoreOptions ?? [];
-    },
-    getSqliteVariant: opts.getSqliteVariant,
-    getSandboxVariants: opts.getSandboxVariants,
-    createInstallAdmin: opts.createInstallAdmin || (async (dbManager) => new SimpleInstallAdmin(dbManager)),
-    getLoginSystem: opts.getLoginSystem || getCoreLoginSystem,
-    createLocalDocStorageManager: opts.createLocalDocStorageManager ?? createDefaultLocalStorageManager,
-    createHostedDocStorageManager: opts.createHostedDocStorageManager ?? createDefaultHostedStorageManager,
-  };
-}
+    };
+  }
 
-async function createDefaultHostedStorageManager(
-  docsRoot: string,
-  docWorkerId: string,
-  disableS3: boolean,
-  docWorkerMap: IDocWorkerMap,
-  dbManager: HomeDBManager,
-  createExternalStorage: ExternalStorageCreator,
-  options?: HostedStorageOptions
-) {
-  return new HostedStorageManager(
-    docsRoot,
-    docWorkerId,
-    disableS3,
-    docWorkerMap,
-    dbManager,
-    createExternalStorage,
-    options
-  );
-}
-
-async function createDefaultLocalStorageManager(
-  docsRoot: string,
-  samplesRoot?: string,
-  comm?: Comm,
-  shell?: IShell
-) {
-  return new DocStorageManager(docsRoot, samplesRoot, comm, shell);
+  public async createInstallAdmin(dbManager: HomeDBManager): Promise<InstallAdmin> {
+    return new SimpleInstallAdmin(dbManager);
+  }
+  public getLoginSystem(): Promise<GristLoginSystem> {
+    return getCoreLoginSystem();
+  }
+  public async createLocalDocStorageManager(...args: ConstructorParameters<typeof DocStorageManager>) {
+    return new DocStorageManager(...args);
+  }
+  public async createHostedDocStorageManager(...args: ConstructorParameters<typeof HostedStorageManager>) {
+    return new HostedStorageManager(...args);
+  }
+  public addExtraHomeEndpoints(gristServer: GristServer, app: Express) {}
+  public areAdminControlsAvailable(): boolean { return false; }
 }

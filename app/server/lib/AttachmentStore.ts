@@ -1,4 +1,8 @@
-import {joinKeySegments, StreamingExternalStorage} from 'app/server/lib/ExternalStorage';
+import {
+  ExternalStorage,
+  joinKeySegments,
+} from 'app/server/lib/ExternalStorage';
+import {MemoryWritableStream} from 'app/server/utils/streams';
 import * as fse from 'fs-extra';
 import * as stream from 'node:stream';
 import * as path from 'path';
@@ -15,6 +19,40 @@ export interface AttachmentStoreDocInfo {
   // programmer must make a conscious choice to mark it as null or undefined, not merely omit it.
   // Omission could easily result in invalid behaviour.
   trunkId: string | null | undefined;
+}
+
+interface FileMetadata {
+  size: number;
+}
+
+export interface AttachmentFile {
+  metadata: FileMetadata,
+  contentStream: stream.Readable,
+  // Used to optimise certain scenarios where the data *must* be in memory (e.g. SQLite read/writes)
+  contents?: Buffer
+}
+
+export interface AttachmentFileInMemory extends AttachmentFile {
+  contents: Buffer;
+}
+
+export function isAttachmentFileInMemory(file: AttachmentFile): file is AttachmentFileInMemory {
+  return file.contents !== undefined;
+}
+
+export async function loadAttachmentFileIntoMemory(file: AttachmentFile): Promise<AttachmentFileInMemory> {
+  if (isAttachmentFileInMemory(file)) {
+    return file;
+  }
+  const memoryStream = new MemoryWritableStream();
+  await stream.promises.pipeline(file.contentStream, memoryStream);
+  const buffer = memoryStream.getBuffer();
+
+  // Use Object.assign because it gives type safety, without having to us `as` or copy the object.
+  return Object.assign(file, {
+    contents: buffer,
+    contentStream: stream.Readable.from(buffer),
+  });
 }
 
 /**
@@ -71,10 +109,11 @@ export interface IAttachmentStore {
   // Upload attachment to the store.
   upload(docPoolId: DocPoolId, fileId: FileId, fileData: stream.Readable): Promise<void>;
 
-  // Download attachment to an in-memory buffer.
-  // It's preferable to accept an output stream as a parameter, as it simplifies attachment store
-  // implementation and gives them control over local buffering.
-  download(docPoolId: DocPoolId, fileId: FileId, outputStream: stream.Writable): Promise<void>;
+  // Fetch the attachment from the store, including a readable stream for the attachment's contents.
+  download(docPoolId: DocPoolId, fileId: FileId): Promise<AttachmentFile>;
+
+  // Remove attachment from the store
+  delete(docPoolId: DocPoolId, fileId: FileId): Promise<void>;
 
   // Remove attachments for all documents in the given document pool.
   removePool(docPoolId: DocPoolId): Promise<void>;
@@ -97,16 +136,21 @@ export class AttachmentStoreCreationError extends Error {
   }
 }
 
+export interface ExternalStorageSupportingAttachments extends ExternalStorage {
+  uploadStream: NonNullable<ExternalStorage['uploadStream']>;
+  downloadStream: NonNullable<ExternalStorage['downloadStream']>;
+  removeAllWithPrefix: NonNullable<ExternalStorage['removeAllWithPrefix']>;
+}
+
+export function storageSupportsAttachments(storage: ExternalStorage): storage is ExternalStorageSupportingAttachments {
+  return Boolean(storage.uploadStream && storage.downloadStream && storage.removeAllWithPrefix);
+}
+
 export class ExternalStorageAttachmentStore implements IAttachmentStore {
   constructor(
     public id: string,
-    private _storage: StreamingExternalStorage,
-    private _prefixParts: string[]
-  ) {
-    if (!_storage.removeAllWithPrefix) {
-      throw new InvalidAttachmentExternalStorageError("ExternalStorage does not support removeAllWithPrefix");
-    }
-  }
+    private _storage: ExternalStorageSupportingAttachments,
+  ) {}
 
   public exists(docPoolId: string, fileId: string): Promise<boolean> {
     return this._storage.exists(this._getKey(docPoolId, fileId));
@@ -116,13 +160,16 @@ export class ExternalStorageAttachmentStore implements IAttachmentStore {
     await this._storage.uploadStream(this._getKey(docPoolId, fileId), fileData);
   }
 
-  public async download(docPoolId: string, fileId: string, outputStream: stream.Writable): Promise<void> {
-    await this._storage.downloadStream(this._getKey(docPoolId, fileId), outputStream);
+  public async download(docPoolId: string, fileId: string): Promise<AttachmentFile> {
+    return await this._storage.downloadStream(this._getKey(docPoolId, fileId));
+  }
+
+  public async delete(docPoolId: string, fileId: string): Promise<void> {
+    await this._storage.remove(this._getKey(docPoolId, fileId));
   }
 
   public async removePool(docPoolId: string): Promise<void> {
-    // Null assertion is safe because this should be checked before this class is instantiated.
-    await this._storage.removeAllWithPrefix!(this._getPoolPrefix(docPoolId));
+    await this._storage.removeAllWithPrefix(this._getPoolPrefix(docPoolId));
   }
 
   public async close(): Promise<void> {
@@ -130,7 +177,7 @@ export class ExternalStorageAttachmentStore implements IAttachmentStore {
   }
 
   private _getPoolPrefix(docPoolId: string): string {
-    return joinKeySegments([...this._prefixParts, docPoolId]);
+    return docPoolId;
   }
 
   private _getKey(docPoolId: string, fileId: string): string {
@@ -157,11 +204,19 @@ export class FilesystemAttachmentStore implements IAttachmentStore {
     );
   }
 
-  public async download(docPoolId: DocPoolId, fileId: FileId, output: stream.Writable): Promise<void> {
-    await stream.promises.pipeline(
-      fse.createReadStream(this._createPath(docPoolId, fileId)),
-      output,
-    );
+  public async download(docPoolId: DocPoolId, fileId: FileId): Promise<AttachmentFile> {
+    const filePath = this._createPath(docPoolId, fileId);
+    const stat = await fse.stat(filePath);
+    return {
+      metadata: {
+        size: stat.size,
+      },
+      contentStream: fse.createReadStream(filePath)
+    };
+  }
+
+  public async delete(docPoolId: string, fileId: string): Promise<void> {
+    await fse.remove(this._createPath(docPoolId, fileId));
   }
 
   public async removePool(docPoolId: DocPoolId): Promise<void> {

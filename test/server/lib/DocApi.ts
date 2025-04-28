@@ -19,6 +19,7 @@ import {delayAbort, getAvailablePort} from 'app/server/lib/serverUtils';
 import axios, {AxiosRequestConfig, AxiosResponse} from 'axios';
 import {delay} from 'bluebird';
 import {assert} from 'chai';
+import decompress from 'decompress';
 import express from 'express';
 import FormData from 'form-data';
 import * as fse from 'fs-extra';
@@ -41,6 +42,7 @@ import * as testUtils from 'test/server/testUtils';
 import {waitForIt} from 'test/server/wait';
 import defaultsDeep = require('lodash/defaultsDeep');
 import pick = require('lodash/pick');
+import range = require('lodash/range')
 import {getDatabase} from 'test/testUtils';
 import {testDailyApiLimitFeatures} from 'test/gen-server/seed';
 
@@ -137,7 +139,8 @@ describe('DocApi', function () {
     setup('merged', async () => {
       const additionalEnvConfiguration = {
         ALLOWED_WEBHOOK_DOMAINS: `example.com,localhost:${webhooksTestPort}`,
-        GRIST_DATA_DIR: dataDir
+        GRIST_DATA_DIR: dataDir,
+        GRIST_EXTERNAL_ATTACHMENTS_MODE: 'test',
       };
       home = docs = await TestServer.startServer('home,docs', tmpDir, suitename, additionalEnvConfiguration);
       homeUrl = serverUrl = home.serverUrl;
@@ -151,7 +154,8 @@ describe('DocApi', function () {
       const additionalEnvConfiguration = {
         ALLOWED_WEBHOOK_DOMAINS: `example.com,localhost:${webhooksTestPort}`,
         GRIST_DATA_DIR: dataDir,
-        GRIST_ANON_PLAYGROUND: 'false'
+        GRIST_ANON_PLAYGROUND: 'false',
+        GRIST_EXTERNAL_ATTACHMENTS_MODE: 'test',
       };
       home = docs = await TestServer.startServer('home,docs', tmpDir, suitename, additionalEnvConfiguration);
       homeUrl = serverUrl = home.serverUrl;
@@ -171,7 +175,8 @@ describe('DocApi', function () {
       setup('separated', async () => {
         const additionalEnvConfiguration = {
           ALLOWED_WEBHOOK_DOMAINS: `example.com,localhost:${webhooksTestPort}`,
-          GRIST_DATA_DIR: dataDir
+          GRIST_DATA_DIR: dataDir,
+          GRIST_EXTERNAL_ATTACHMENTS_MODE: 'test',
         };
 
         home = await TestServer.startServer('home', tmpDir, suitename, additionalEnvConfiguration);
@@ -199,6 +204,7 @@ describe('DocApi', function () {
           GRIST_ORG_IN_PATH: 'true',
           GRIST_SINGLE_PORT: '0',
           APP_HOME_INTERNAL_URL: withAppHomeInternalUrl ? home.serverUrl : '',
+          GRIST_EXTERNAL_ATTACHMENTS_MODE: 'test',
         };
 
         await home.start(home.serverUrl, additionalEnvConfiguration);
@@ -287,7 +293,8 @@ describe('DocApi', function () {
       setup('docs', async () => {
         const additionalEnvConfiguration = {
           ALLOWED_WEBHOOK_DOMAINS: `example.com,localhost:${webhooksTestPort}`,
-          GRIST_DATA_DIR: dataDir
+          GRIST_DATA_DIR: dataDir,
+          GRIST_EXTERNAL_ATTACHMENTS_MODE: 'test',
         };
         home = await TestServer.startServer('home', tmpDir, suitename, additionalEnvConfiguration);
         homeUrl = home.serverUrl;
@@ -2427,28 +2434,37 @@ function testDocApi(settings: {
 
   });
 
+  async function addAttachmentsToDoc(docId: string, attachments: {name: string, contents: string}[],
+                                     user: AxiosRequestConfig = chimpy) {
+    const formData = new FormData();
+    for (const attachment of attachments) {
+      formData.append('upload', attachment.contents, attachment.name);
+    }
+    const resp = await axios.post(`${homeUrl}/api/docs/${docId}/attachments`, formData,
+      defaultsDeep({headers: formData.getHeaders()}, user));
+    assert.equal(resp.status, 200);
+    assert.equal(resp.data.length, attachments.length);
+    return resp;
+  }
+
   describe('attachments', function () {
     it("POST /docs/{did}/attachments adds attachments", async function () {
-      let formData = new FormData();
-      formData.append('upload', 'foobar', "hello.doc");
-      formData.append('upload', '123456', "world.jpg");
-      let resp = await axios.post(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments`, formData,
-        defaultsDeep({headers: formData.getHeaders()}, chimpy));
-      assert.equal(resp.status, 200);
-      assert.deepEqual(resp.data, [1, 2]);
+      const uploadResp = await addAttachmentsToDoc(docIds.TestDoc, [
+        { name: 'hello.doc', contents: 'foobar' },
+        { name: 'world.jpg', contents: '123456' },
+      ], chimpy);
+      assert.deepEqual(uploadResp.data, [1, 2]);
 
       // Another upload gets the next number.
-      formData = new FormData();
-      formData.append('upload', 'abcdef', "hello.png");
-      resp = await axios.post(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments`, formData,
-        defaultsDeep({headers: formData.getHeaders()}, chimpy));
-      assert.equal(resp.status, 200);
-      assert.deepEqual(resp.data, [3]);
+      const upload2Resp = await addAttachmentsToDoc(docIds.TestDoc, [
+        { name: 'hello.png', contents: 'abcdef' },
+      ], chimpy);
+      assert.deepEqual(upload2Resp.data, [3]);
     });
 
     it("GET /docs/{did}/attachments lists attachment metadata", async function () {
       // Test that the usual /records query parameters like sort and filter also work
-      const url = `${serverUrl}/api/docs/${docIds.TestDoc}/attachments?sort=-fileName&limit=2`;
+      const url = `${homeUrl}/api/docs/${docIds.TestDoc}/attachments?sort=-fileName&limit=2`;
       const resp = await axios.get(url, chimpy);
       assert.equal(resp.status, 200);
       const {records} = resp.data;
@@ -2464,14 +2480,14 @@ function testDocApi(settings: {
     });
 
     it("GET /docs/{did}/attachments/{id} returns attachment metadata", async function () {
-      const resp = await axios.get(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments/2`, chimpy);
+      const resp = await axios.get(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments/2`, chimpy);
       assert.equal(resp.status, 200);
       assert.include(resp.data, {fileName: "world.jpg", fileSize: 6});
       assert.match(resp.data.timeUploaded, /^\d{4}-\d{2}-\d{2}T/);
     });
 
     it("GET /docs/{did}/attachments/{id}/download downloads attachment contents", async function () {
-      const resp = await axios.get(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments/2/download`,
+      const resp = await axios.get(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments/2/download`,
         {...chimpy, responseType: 'arraybuffer'});
       assert.equal(resp.status, 200);
       assert.deepEqual(resp.headers['content-type'], 'image/jpeg');
@@ -2480,11 +2496,66 @@ function testDocApi(settings: {
       assert.deepEqual(resp.data, Buffer.from('123456'));
     });
 
+    async function assertArchiveContents(archive: string | Buffer, expectedFiles: { name: string; contents?: string }[])
+    {
+      const getFileName = (filePath: string) => filePath.substring(filePath.indexOf("_") + 1);
+      const files = await decompress(archive);
+      for (const expectedFile of expectedFiles) {
+        const file = files.find((file) => getFileName(file.path) === expectedFile.name);
+        assert(file, "file not found in archive");
+        if (expectedFile.contents) {
+          assert.equal(file?.data.toString(), expectedFile.contents, "file contents in archive don't match");
+        }
+      }
+    }
+
+    it("GET /docs/{did}/attachments/archive downloads all attachments as a .zip", async function () {
+      const resp = await axios.get(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments/archive`,
+        {...chimpy, responseType: 'arraybuffer'});
+      assert.equal(resp.status, 200);
+      assert.deepEqual(resp.headers['content-type'], 'application/zip');
+      assert.deepEqual(resp.headers['content-disposition'], `attachment; filename="TestDoc-Attachments.zip"`);
+
+      await assertArchiveContents(resp.data, [
+        {
+          name: 'hello.doc',
+          contents: 'foobar',
+        },
+        {
+          name: 'world.jpg',
+        },
+        {
+          name: 'hello.png',
+        },
+      ]);
+    });
+
+    it("GET /docs/{did}/attachments/archive downloads all attachments as a .tar", async function () {
+      const resp = await axios.get(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments/archive?format=tar`,
+        {...chimpy, responseType: 'arraybuffer'});
+      assert.equal(resp.status, 200);
+      assert.deepEqual(resp.headers['content-type'], 'application/x-tar');
+      assert.deepEqual(resp.headers['content-disposition'], `attachment; filename="TestDoc-Attachments.tar"`);
+
+      await assertArchiveContents(resp.data, [
+        {
+          name: 'hello.doc',
+          contents: 'foobar',
+        },
+        {
+          name: 'world.jpg',
+        },
+        {
+          name: 'hello.png',
+        },
+      ]);
+    });
+
     it("GET /docs/{did}/attachments/{id}/download works after doc shutdown", async function () {
       // Check that we can download when ActiveDoc isn't currently open.
-      let resp = await axios.post(`${serverUrl}/api/docs/${docIds.TestDoc}/force-reload`, null, chimpy);
+      let resp = await axios.post(`${homeUrl}/api/docs/${docIds.TestDoc}/force-reload`, null, chimpy);
       assert.equal(resp.status, 200);
-      resp = await axios.get(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments/2/download`,
+      resp = await axios.get(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments/2/download`,
         {...chimpy, responseType: 'arraybuffer'});
       assert.equal(resp.status, 200);
       assert.deepEqual(resp.headers['content-type'], 'image/jpeg');
@@ -2494,24 +2565,24 @@ function testDocApi(settings: {
     });
 
     it("GET /docs/{did}/attachments/{id}... returns 404 when attachment not found", async function () {
-      let resp = await axios.get(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments/22`, chimpy);
+      let resp = await axios.get(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments/22`, chimpy);
       checkError(404, /Attachment not found: 22/, resp);
-      resp = await axios.get(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments/moo`, chimpy);
+      resp = await axios.get(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments/moo`, chimpy);
       checkError(400, /parameter cannot be understood as an integer: moo/, resp);
-      resp = await axios.get(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments/22/download`, chimpy);
+      resp = await axios.get(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments/22/download`, chimpy);
       checkError(404, /Attachment not found: 22/, resp);
-      resp = await axios.get(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments/moo/download`, chimpy);
+      resp = await axios.get(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments/moo/download`, chimpy);
       checkError(400, /parameter cannot be understood as an integer: moo/, resp);
     });
 
     it("POST /docs/{did}/attachments produces reasonable errors", async function () {
       // Check that it produces reasonable errors if we try to use it with non-form-data
-      let resp = await axios.post(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments`, [4, 5, 6], chimpy);
+      let resp = await axios.post(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments`, [4, 5, 6], chimpy);
       assert.equal(resp.status, 415);     // Wrong content-type
 
       // Check for an error if there is no data included.
       const formData = new FormData();
-      resp = await axios.post(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments`, formData,
+      resp = await axios.post(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments`, formData,
         defaultsDeep({headers: formData.getHeaders()}, chimpy));
       assert.equal(resp.status, 400);
       // TODO The error here is "stream ended unexpectedly", which isn't really reasonable.
@@ -2520,14 +2591,14 @@ function testDocApi(settings: {
     it("POST/GET /docs/{did}/attachments respect document permissions", async function () {
       const formData = new FormData();
       formData.append('upload', 'xyzzz', "wrong.png");
-      let resp = await axios.post(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments`, formData,
+      let resp = await axios.post(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments`, formData,
         defaultsDeep({headers: formData.getHeaders()}, kiwi));
       checkError(403, /No view access/, resp);
 
-      resp = await axios.get(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments/3`, kiwi);
+      resp = await axios.get(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments/3`, kiwi);
       checkError(403, /No view access/, resp);
 
-      resp = await axios.get(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments/3/download`, kiwi);
+      resp = await axios.get(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments/3/download`, kiwi);
       checkError(403, /No view access/, resp);
     });
 
@@ -2536,24 +2607,24 @@ function testDocApi(settings: {
       formData.append('upload', 'xyz', {filename: "foo", contentType: "application/pdf"});
       formData.append('upload', 'abc', {filename: "hello.png", contentType: "invalid/content-type"});
       formData.append('upload', 'def', {filename: "world.doc", contentType: "text/plain\nbad-header: 1\n\nEvil"});
-      let resp = await axios.post(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments`, formData,
+      let resp = await axios.post(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments`, formData,
         defaultsDeep({headers: formData.getHeaders()}, chimpy));
       assert.equal(resp.status, 200);
       assert.deepEqual(resp.data, [4, 5, 6]);
 
-      resp = await axios.get(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments/4/download`, chimpy);
+      resp = await axios.get(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments/4/download`, chimpy);
       assert.equal(resp.status, 200);
       assert.deepEqual(resp.headers['content-type'], 'application/pdf');    // A valid content-type is respected
       assert.deepEqual(resp.headers['content-disposition'], 'attachment; filename="foo.pdf"');
       assert.deepEqual(resp.data, 'xyz');
 
-      resp = await axios.get(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments/5/download`, chimpy);
+      resp = await axios.get(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments/5/download`, chimpy);
       assert.equal(resp.status, 200);
       assert.deepEqual(resp.headers['content-type'], 'image/png');    // Did not pay attention to invalid header
       assert.deepEqual(resp.headers['content-disposition'], 'attachment; filename="hello.png"');
       assert.deepEqual(resp.data, 'abc');
 
-      resp = await axios.get(`${serverUrl}/api/docs/${docIds.TestDoc}/attachments/6/download`, chimpy);
+      resp = await axios.get(`${homeUrl}/api/docs/${docIds.TestDoc}/attachments/6/download`, chimpy);
       assert.equal(resp.status, 200);
       assert.deepEqual(resp.headers['content-type'], 'application/msword');    // Another invalid header ignored
       assert.deepEqual(resp.headers['content-disposition'], 'attachment; filename="world.doc"');
@@ -2574,7 +2645,7 @@ function testDocApi(settings: {
         userData: { id: number, Attached: any }[],
         metaData: { id: number, deleted: boolean }[],
       ) {
-        const docUrl = `${serverUrl}/api/docs/${docId}`;
+        const docUrl = `${homeUrl}/api/docs/${docId}`;
 
         let resp = await axios.post(`${docUrl}/apply`, actions, chimpy);
         assert.equal(resp.status, 200);
@@ -2691,7 +2762,7 @@ function testDocApi(settings: {
     it("POST /docs/{did}/attachments/removeUnused removes unused attachments", async function () {
       const wid = await getWorkspaceId(userApi, 'Private');
       const docId = await userApi.newDoc({name: 'TestDoc3'}, wid);
-      const docUrl = `${serverUrl}/api/docs/${docId}`;
+      const docUrl = `${homeUrl}/api/docs/${docId}`;
 
       const formData = new FormData();
       formData.append('upload', 'foobar', "hello.doc");
@@ -2738,6 +2809,166 @@ function testDocApi(settings: {
       await checkAttachmentIds([]);
     });
 
+    describe("external attachment stores", async () => {
+      let docId = "";
+      let docUrl = "";
+
+      before(async () => {
+        const wid = await getWorkspaceId(userApi, 'Private');
+        docId = await userApi.newDoc({name: 'TestDocExternalAttachments'}, wid);
+        docUrl = `${homeUrl}/api/docs/${docId}`;
+
+        const resp = await addAttachmentsToDoc(docId, [
+          { name: 'hello.doc', contents: 'foobar' },
+          { name: 'world.jpg', contents: '123456' },
+          // Duplicate of 'hello.doc', so only 2 files should be in external storage.
+          { name: 'hello2.doc', contents: 'foobar' }
+        ], chimpy);
+        assert.deepEqual(resp.data, [1, 2, 3]);
+      });
+
+      after(async () => {
+        await userApi?.deleteDoc(docId);
+      });
+
+      it("GET /docs/{did}/attachments/transferStatus reports idle transfer status", async function () {
+        const resp = await axios.get(`${docUrl}/attachments/transferStatus`, chimpy);
+        assert.deepEqual(resp.data, {
+          status: {
+            pendingTransferCount: 0,
+            isRunning: false,
+          },
+          locationSummary: "internal",
+        });
+      });
+
+      it("GET /docs/{did}/attachments/store gets the external store", async function () {
+        const resp = await axios.get(`${docUrl}/attachments/store`, chimpy);
+        assert.equal(resp.data.type, 'internal');
+      });
+
+      it("POST /docs/{did}/attachments/store sets the external store", async function () {
+        const postResp = await axios.post(`${docUrl}/attachments/store`, {
+          type: 'external',
+        }, chimpy);
+        assert.equal(postResp.status, 200, JSON.stringify(postResp.data));
+
+        const getResp = await axios.get(`${docUrl}/attachments/store`, chimpy);
+        assert.equal(getResp.data.type, 'external');
+      });
+
+      it("POST /docs/{did}/attachments/transferAll transfers all attachments", async function () {
+        const transferResp = await axios.post(`${docUrl}/attachments/transferAll`, {}, chimpy);
+
+        assert.deepEqual(transferResp.data, {
+          status: {
+            pendingTransferCount: 2,
+            isRunning: true,
+          },
+          locationSummary: "internal",
+        });
+      });
+
+      it("GET /docs/{did}/attachments/archive downloads all attachments as a .zip when external", async function () {
+        const resp = await axios.get(`${docUrl}/attachments/archive`,
+          {...chimpy, responseType: 'arraybuffer'});
+        assert.equal(resp.status, 200);
+        assert.deepEqual(resp.headers['content-type'], 'application/zip');
+        assert.deepEqual(resp.headers['content-disposition'],
+          `attachment; filename="TestDocExternalAttachments-Attachments.zip"`
+        );
+
+        await assertArchiveContents(resp.data, [
+          {
+            name: 'hello.doc',
+            contents: 'foobar',
+          },
+          {
+            name: 'world.jpg',
+          },
+        ]);
+      });
+
+      it("POST /docs/{did}/attachments/archive adds missing attachments from a .tar", async function () {
+        const archiveResp = await axios.get(`${docUrl}/attachments/archive?format=tar`,
+          {...chimpy, responseType: 'arraybuffer'});
+        assert.equal(archiveResp.status, 200, "can download the archive");
+
+        const docResp = await axios.get(`${docUrl}/download`,
+          {...chimpy, responseType: 'arraybuffer'});
+        assert.equal(docResp.status, 200, "can download the doc");
+
+        const docWorkspaceId = (await axios.get(docUrl, chimpy)).data.workspace.id;
+
+        const docUploadForm = new FormData();
+        docUploadForm.append("upload", docResp.data, "ExternalAttachmentsMissing.grist");
+        docUploadForm.append("workspaceId", docWorkspaceId);
+        const docUploadResp = await axios.post(`${homeUrl}/api/docs`, docUploadForm,
+          defaultsDeep({headers: docUploadForm.getHeaders()}, chimpy));
+        assert.equal(docUploadResp.status, 200, "can upload the doc");
+
+        const newDocId = docUploadResp.data;
+
+        const tarUploadForm = new FormData();
+        tarUploadForm.append("upload", archiveResp.data, {
+          filename: "AttachmentsAreHere.tar",
+          contentType: "application/x-tar",
+        });
+
+        const tarUploadResp = await axios.post(`${homeUrl}/api/docs/${newDocId}/attachments/archive`, tarUploadForm,
+          defaultsDeep({headers: tarUploadForm.getHeaders()}, chimpy));
+        assert.equal(tarUploadResp.status, 200, "can upload the attachment archive");
+
+        assert.deepEqual(tarUploadResp.data, {
+          added: 2,
+          errored: 0,
+          // One attachment in the .tar is a duplicate (identical content + extension), so it won't be used
+          unused: 1,
+        }, "2 attachments should be added, 1 unused, no errors");
+      });
+
+      it("POST /docs/{did}/attachments/archive errors if no .tar file is found", async function () {
+        const badUploadForm = new FormData();
+        badUploadForm.append("upload", "Random content", {
+          filename: "AttachmentsAreHere.zip",
+          contentType: "application/zip",
+        });
+
+        const tarUploadResp = await axios.post(`${docUrl}/attachments/archive`, badUploadForm,
+          defaultsDeep({headers: badUploadForm.getHeaders()}, chimpy));
+        assert.equal(tarUploadResp.status, 400, "should be a bad request");
+      });
+
+      it("POST /docs/{did}/attachments/archive has a useful error if a bad file is used", async function () {
+        const badUploadForm = new FormData();
+        badUploadForm.append("upload", "Random content", {
+          filename: "AttachmentsAreHere.tar",
+          contentType: "application/x-tar",
+        });
+
+        const tarUploadResp = await axios.post(`${docUrl}/attachments/archive`, badUploadForm,
+          defaultsDeep({headers: badUploadForm.getHeaders()}, chimpy));
+        assert.equal(tarUploadResp.status, 500, "should be a bad request");
+        assert.deepEqual(tarUploadResp.data, { error: "File is not a valid .tar" });
+      });
+
+      it("POST /docs/{did}/copy fails when the document has external attachments", async function () {
+        const worker1 = await userApi.getWorkerAPI(docId);
+        await assert.isRejected(worker1.copyDoc(docId, undefined, 'copy'), /status 400/);
+      });
+
+      it("POST /docs/{did} with sourceDocId fails to copy a document with external attachments", async function () {
+        const chimpyWs = await userApi.newWorkspace({name: "Chimpy's Workspace"}, ORG_NAME);
+        const resp = await axios.post(`${homeUrl}/api/docs`, {
+          sourceDocumentId: docId,
+          documentName: 'copy of TestDocExternalAttachments',
+          asTemplate: false,
+          workspaceId: chimpyWs
+        }, chimpy);
+        assert.equal(resp.status, 400);
+        assert.match(resp.data.error, /external attachments/);
+      });
+    });
   });
 
   it("GET /docs/{did}/download serves document", async function () {
@@ -2754,7 +2985,7 @@ function testDocApi(settings: {
   });
 
   // A tiny test that /copy doesn't throw.
-  it("POST /docs/{did}/copy succeeds", async function () {
+  it("POST /copy succeeds on a doc worker", async function () {
     const docId = docIds.TestDoc;
     const worker1 = await userApi.getWorkerAPI(docId);
     await worker1.copyDoc(docId, undefined, 'copy');
@@ -2767,6 +2998,16 @@ function testDocApi(settings: {
       documentName: 'copy of TestDoc',
       asTemplate: false,
       workspaceId: chimpyWs
+    }, chimpy);
+    assert.equal(resp.status, 200);
+    assert.isString(resp.data);
+  });
+
+  it("POST /docs/{did}/copy copies a document", async function () {
+    const chimpyWs2 = await userApi.newWorkspace({name: "Chimpy's Workspace 2"}, ORG_NAME);
+    const resp = await axios.post(`${serverUrl}/api/docs/${docIds.TestDoc}/copy`, {
+      documentName: 'copy of TestDoc',
+      workspaceId: chimpyWs2,
     }, chimpy);
     assert.equal(resp.status, 200);
     assert.isString(resp.data);
@@ -2973,6 +3214,24 @@ function testDocApi(settings: {
     assert.notEqual(resp.data.id, '');
   });
 
+  it(`POST /workspaces/{wid}/import can import a new file`, async function () {
+    const wid = (await userApi.getOrgWorkspaces('current')).find((w) => w.name === 'Private')!.id;
+    const formData = new FormData();
+    formData.append('upload', 'A,B\n1,2\n3,4\n', 'table1.csv');
+    const config = defaultsDeep({headers: formData.getHeaders()}, chimpy);
+    const importResp = await axios.post(`${homeUrl}/api/workspaces/${wid}/import`, formData, config);
+    assert.equal(importResp.status, 200);
+    const urlId = importResp.data.id;
+
+    const docDetailsResp = await axios.get(`${homeUrl}/api/docs/${urlId}`, chimpy);
+    assert.equal(docDetailsResp.status, 200);
+    assert.equal(docDetailsResp.data.name, 'table1');
+    assert.equal(docDetailsResp.data.workspace.name, 'Private');
+
+    // content was successfully stored
+    const contentResp = await axios.get(`${homeUrl}/api/docs/${urlId}/tables/Table1/data`, chimpy);
+    assert.deepEqual(contentResp.data, {id: [1, 2], manualSort: [1, 2], A: [1, 3], B: [2, 4]});
+  });
 
   it("handles /s/ variants for shares", async function () {
     const wid = (await userApi.getOrgWorkspaces('current')).find((w) => w.name === 'Private')!.id;
@@ -3363,7 +3622,7 @@ function testDocApi(settings: {
       rightChanges: {tableRenames: [], tableDeltas: {}}
     });
 
-    await doc2.addRows('Table1', {A: [2]});
+    await doc2.addRows('Table1', {A: range(2, 100)});
     comp = await doc1.compareDoc(docId2);
     assert.equal(comp.summary, 'right');
     assert.equal(comp.left.n, 3);
@@ -3374,22 +3633,54 @@ function testDocApi(settings: {
     comp = await doc1.compareDoc(docId2, {detail: true});
     assert.deepEqual(comp.details!.leftChanges,
       {tableRenames: [], tableDeltas: {}});
-    const addA2: ActionSummary = {
+    const addA2To99Truncated: ActionSummary = {
       tableRenames: [],
       tableDeltas: {
         Table1: {
           updateRows: [],
           removeRows: [],
-          addRows: [3],
+          addRows: range(3, 101),
           columnDeltas: {
-            A: {[3]: [null, [2]]},
-            manualSort: {[3]: [null, [3]]},
+            A: [...range(3, 12), 100].reduce(
+              (acc, cur) => ({ ...acc, [cur]: [null, [cur - 1]] }),
+              {}
+            ),
+            manualSort: [...range(3, 12), 100].reduce(
+              (acc, cur) => ({ ...acc, [cur]: [null, [cur]] }),
+              {}
+            ),
           },
           columnRenames: [],
-        }
-      }
+        },
+      },
     };
-    assert.deepEqual(comp.details!.rightChanges, addA2);
+    assert.deepEqual(comp.details!.rightChanges, addA2To99Truncated);
+
+    const addA2To99Full: ActionSummary = {
+      tableRenames: [],
+      tableDeltas: {
+        Table1: {
+          updateRows: [],
+          removeRows: [],
+          addRows: range(3, 101),
+          columnDeltas: {
+            A: range(3, 101).reduce(
+              (acc, cur) => ({ ...acc, [cur]: [null, [cur - 1]] }),
+              {}
+            ),
+            manualSort: range(3, 101).reduce(
+              (acc, cur) => ({ ...acc, [cur]: [null, [cur]] }),
+              {}
+            ),
+          },
+          columnRenames: [],
+        },
+      },
+    };
+    for (const maxRows of [100, null]) {
+      comp = await doc1.compareDoc(docId2, {detail: true, maxRows});
+      assert.deepEqual(comp.details!.rightChanges, addA2To99Full);
+    }
   });
 
   it("GET /docs/{did}/compare tracks changes within a doc", async function () {
@@ -4167,18 +4458,21 @@ function testDocApi(settings: {
         if (!process.env.TEST_REDIS_URL) {
           this.skip();
         }
-        requests = {
-          "add,update": [],
-          "add": [],
-          "update": [],
-        };
 
-        redisCalls = [];
         redisMonitor = createClient(process.env.TEST_REDIS_URL);
         redisMonitor.monitor();
         redisMonitor.on("monitor", (_time: any, args: any, _rawReply: any) => {
           redisCalls.push(args);
         });
+      });
+
+      beforeEach(function () {
+        requests = {
+          "add,update": [],
+          "add": [],
+          "update": [],
+        };
+        redisCalls = [];
       });
 
       after(async function () {
@@ -4187,8 +4481,22 @@ function testDocApi(settings: {
         }
       });
 
-      async function createWebhooks({docId, tableId, eventTypesSet, isReadyColumn, enabled}:
-        {docId: string, tableId: string, eventTypesSet: string[][], isReadyColumn: string, enabled?: boolean}
+      async function createWebhooks(
+        {
+          docId,
+          tableId,
+          eventTypesSet,
+          isReadyColumn,
+          watchedColIds,
+          enabled
+        }: {
+          docId: string,
+          tableId: string,
+          eventTypesSet: string[][],
+          isReadyColumn: string,
+          watchedColIds?: string[],
+          enabled?: boolean
+        }
       ) {
         // Ensure the isReady column is a Boolean
         await axios.post(`${serverUrl}/api/docs/${docId}/apply`, [
@@ -4199,131 +4507,145 @@ function testDocApi(settings: {
         const webhookIds: Record<string, string> = {};
 
         for (const eventTypes of eventTypesSet) {
-          const data = await subscribe(String(eventTypes), docId, {tableId, eventTypes, isReadyColumn, enabled});
+          const data = await subscribe(String(eventTypes), docId, {
+            tableId,
+            eventTypes,
+            isReadyColumn,
+            watchedColIds,
+            enabled,
+          });
           subscribeResponses.push(data);
           webhookIds[data.webhookId] = String(eventTypes);
         }
         return {subscribeResponses, webhookIds};
       }
 
-      it("delivers expected payloads from combinations of changes, with retrying and batching",
-        async function () {
-        // Create a test document.
-        const ws1 = (await userApi.getOrgWorkspaces('current'))[0].id;
-        const docId = await userApi.newDoc({name: 'testdoc'}, ws1);
-        const doc = userApi.getDocAPI(docId);
+      [{
+        itMsg: "delivers expected payloads from combinations of changes, with retrying and batching",
+        watchedColIds: undefined,
+      }, {
+        itMsg: "delivers expected payloads when watched col ids are set",
+        watchedColIds: ["A", "B"],
+      }].forEach((ctx) => {
+        it(ctx.itMsg,
+          async function () {
+          // Create a test document.
+          const ws1 = (await userApi.getOrgWorkspaces('current'))[0].id;
+          const docId = await userApi.newDoc({name: 'testdoc'}, ws1);
+          const doc = userApi.getDocAPI(docId);
 
-        // Make a webhook for every combination of event types
-        const {subscribeResponses, webhookIds} = await createWebhooks({
-          docId, tableId: 'Table1', isReadyColumn: "B",
-          eventTypesSet: [
-            ["add"],
-            ["update"],
-            ["add", "update"],
-          ]
-        });
-
-        // Add and update some rows, trigger some events
-        // Values of A where B is true and thus the record is ready are [1, 4, 7, 8]
-        // So those are the values seen in expectedEvents
-        await doc.addRows("Table1", {
-          A: [1, 2],
-          B: [true, false], // 1  is ready, 2 is not ready yet
-        });
-        await doc.updateRows("Table1", {id: [2], A: [3]});  // still not ready
-        await doc.updateRows("Table1", {id: [2], A: [4], B: [true]});  // ready!
-        await doc.updateRows("Table1", {id: [2], A: [5], B: [false]});  // not ready again
-        await doc.updateRows("Table1", {id: [2], A: [6]});  // still not ready
-        await doc.updateRows("Table1", {id: [2], A: [7], B: [true]});  // ready!
-        await doc.updateRows("Table1", {id: [2], A: [8]});  // still ready!
-
-        // The end result here is additions for column A (now A3) with values [13, 15, 18]
-        // and an update for 101
-        await axios.post(`${serverUrl}/api/docs/${docId}/apply`, [
-          ['BulkAddRecord', 'Table1', [3, 4, 5, 6], {A: [9, 10, 11, 12], B: [true, true, false, false]}],
-          ['BulkUpdateRecord', 'Table1', [1, 2, 3, 4, 5, 6], {
-            A: [101, 102, 13, 14, 15, 16],
-            B: [true, false, true, false, true, false],
-          }],
-
-          ['RenameColumn', 'Table1', 'A', 'A3'],
-          ['RenameColumn', 'Table1', 'B', 'B3'],
-
-          ['RenameTable', 'Table1', 'Table12'],
-
-          // FIXME a double rename A->A2->A3 doesn't seem to get summarised correctly
-          // ['RenameColumn', 'Table12', 'A2', 'A3'],
-          // ['RenameColumn', 'Table12', 'B2', 'B3'],
-
-          ['RemoveColumn', 'Table12', 'C'],
-        ], chimpy);
-
-        // FIXME record changes after a RenameTable in the same bundle
-        //  don't appear in the action summary
-        await axios.post(`${serverUrl}/api/docs/${docId}/apply`, [
-          ['AddRecord', 'Table12', 7, {A3: 17, B3: false}],
-          ['UpdateRecord', 'Table12', 7, {A3: 18, B3: true}],
-
-          ['AddRecord', 'Table12', 8, {A3: 19, B3: true}],
-          ['UpdateRecord', 'Table12', 8, {A3: 20, B3: false}],
-
-          ['AddRecord', 'Table12', 9, {A3: 20, B3: true}],
-          ['RemoveRecord', 'Table12', 9],
-        ], chimpy);
-
-        // Add 200 rows. These become the `expected200AddEvents`
-        await doc.addRows("Table12", {
-          A3: _.range(200, 400),
-          B3: arrayRepeat(200, true),
-        });
-
-        await receivedLastEvent;
-
-        // Unsubscribe
-        await Promise.all(subscribeResponses.map(async subscribeResponse => {
-          const unsubscribeResponse = await axios.post(
-            `${serverUrl}/api/docs/${docId}/tables/Table12/_unsubscribe`,
-            subscribeResponse, chimpy
-          );
-          assert.equal(unsubscribeResponse.status, 200);
-          assert.deepEqual(unsubscribeResponse.data, {success: true});
-        }));
-
-        // Further changes should generate no events because the triggers are gone
-        await doc.addRows("Table12", {
-          A3: [88, 99],
-          B3: [true, false],
-        });
-
-        assert.deepEqual(requests, expectedRequests);
-
-        // Check that the events were all pushed to the redis queue
-        const queueRedisCalls = redisCalls.filter(args => args[1] === "webhook-queue-" + docId);
-        const redisPushes = _.chain(queueRedisCalls)
-          .filter(args => args[0] === "rpush")          // Array<["rpush", key, ...events: string[]]>
-          .flatMap(args => args.slice(2))               // events: string[]
-          .map(JSON.parse)                              // events: WebhookEvent[]
-          .groupBy('id')                                // {[webHookId: string]: WebhookEvent[]}
-          .mapKeys((_value, key) => webhookIds[key])    // {[eventTypes: 'add'|'update'|'add,update']: WebhookEvent[]}
-          .mapValues(group => _.map(group, 'payload'))  // {[eventTypes: 'add'|'update'|'add,update']: RowRecord[]}
-          .value();
-        const expectedPushes = _.mapValues(expectedRequests, value => _.flatten(value));
-        assert.deepEqual(redisPushes, expectedPushes);
-
-        // Check that the events were all removed from the redis queue
-        const redisTrims = queueRedisCalls.filter(args => args[0] === "ltrim")
-          .map(([, , start, end]) => {
-            assert.equal(end, '-1');
-            start = Number(start);
-            assert.isTrue(start > 0);
-            return start;
+          // Make a webhook for every combination of event types
+          const {subscribeResponses, webhookIds} = await createWebhooks({
+            docId, tableId: 'Table1', isReadyColumn: "B", watchedColIds: ctx.watchedColIds,
+            eventTypesSet: [
+              ["add"],
+              ["update"],
+              ["add", "update"],
+            ]
           });
-        const expectedTrims = Object.values(redisPushes).map(value => value.length);
-        assert.equal(
-          _.sum(redisTrims),
-          _.sum(expectedTrims),
-        );
 
+          // Add and update some rows, trigger some events
+          // Values of A where B is true and thus the record is ready are [1, 4, 7, 8]
+          // So those are the values seen in expectedEvents
+          await doc.addRows("Table1", {
+            A: [1, 2],
+            B: [true, false], // 1  is ready, 2 is not ready yet
+          });
+          await doc.updateRows("Table1", {id: [2], A: [3]});  // still not ready
+          await doc.updateRows("Table1", {id: [2], A: [4], B: [true]});  // ready!
+          await doc.updateRows("Table1", {id: [2], A: [5], B: [false]});  // not ready again
+          await doc.updateRows("Table1", {id: [2], A: [6]});  // still not ready
+          await doc.updateRows("Table1", {id: [2], A: [7], B: [true]});  // ready!
+          await doc.updateRows("Table1", {id: [2], A: [8]});  // still ready!
+
+          // The end result here is additions for column A (now A3) with values [13, 15, 18]
+          // and an update for 101
+          await axios.post(`${serverUrl}/api/docs/${docId}/apply`, [
+            ['BulkAddRecord', 'Table1', [3, 4, 5, 6], {A: [9, 10, 11, 12], B: [true, true, false, false]}],
+            ['BulkUpdateRecord', 'Table1', [1, 2, 3, 4, 5, 6], {
+              A: [101, 102, 13, 14, 15, 16],
+              B: [true, false, true, false, true, false],
+            }],
+
+            ['RenameColumn', 'Table1', 'A', 'A3'],
+            ['RenameColumn', 'Table1', 'B', 'B3'],
+
+            ['RenameTable', 'Table1', 'Table12'],
+
+            // FIXME a double rename A->A2->A3 doesn't seem to get summarised correctly
+            // ['RenameColumn', 'Table12', 'A2', 'A3'],
+            // ['RenameColumn', 'Table12', 'B2', 'B3'],
+
+            ['RemoveColumn', 'Table12', 'C'],
+          ], chimpy);
+
+          // FIXME record changes after a RenameTable in the same bundle
+          //  don't appear in the action summary
+          await axios.post(`${serverUrl}/api/docs/${docId}/apply`, [
+            ['AddRecord', 'Table12', 7, {A3: 17, B3: false}],
+            ['UpdateRecord', 'Table12', 7, {A3: 18, B3: true}],
+
+            ['AddRecord', 'Table12', 8, {A3: 19, B3: true}],
+            ['UpdateRecord', 'Table12', 8, {A3: 20, B3: false}],
+
+            ['AddRecord', 'Table12', 9, {A3: 20, B3: true}],
+            ['RemoveRecord', 'Table12', 9],
+          ], chimpy);
+
+          // Add 200 rows. These become the `expected200AddEvents`
+          await doc.addRows("Table12", {
+            A3: _.range(200, 400),
+            B3: arrayRepeat(200, true),
+          });
+
+          await receivedLastEvent;
+
+          // Unsubscribe
+          await Promise.all(subscribeResponses.map(async subscribeResponse => {
+            const unsubscribeResponse = await axios.post(
+              `${serverUrl}/api/docs/${docId}/tables/Table12/_unsubscribe`,
+              subscribeResponse, chimpy
+            );
+            assert.equal(unsubscribeResponse.status, 200);
+            assert.deepEqual(unsubscribeResponse.data, {success: true});
+          }));
+
+          // Further changes should generate no events because the triggers are gone
+          await doc.addRows("Table12", {
+            A3: [88, 99],
+            B3: [true, false],
+          });
+
+          assert.deepEqual(requests, expectedRequests);
+
+          // Check that the events were all pushed to the redis queue
+          const queueRedisCalls = redisCalls.filter(args => args[1] === "webhook-queue-" + docId);
+          const redisPushes = _.chain(queueRedisCalls)
+            .filter(args => args[0] === "rpush")          // Array<["rpush", key, ...events: string[]]>
+            .flatMap(args => args.slice(2))               // events: string[]
+            .map(JSON.parse)                              // events: WebhookEvent[]
+            .groupBy('id')                                // {[webHookId: string]: WebhookEvent[]}
+            .mapKeys((_value, key) => webhookIds[key])    // {[eventTypes: 'add'|'update'|'add,update']: WebhookEvent[]}
+            .mapValues(group => _.map(group, 'payload'))  // {[eventTypes: 'add'|'update'|'add,update']: RowRecord[]}
+            .value();
+          const expectedPushes = _.mapValues(expectedRequests, value => _.flatten(value));
+          assert.deepEqual(redisPushes, expectedPushes);
+
+          // Check that the events were all removed from the redis queue
+          const redisTrims = queueRedisCalls.filter(args => args[0] === "ltrim")
+            .map(([, , start, end]) => {
+              assert.equal(end, '-1');
+              start = Number(start);
+              assert.isTrue(start > 0);
+              return start;
+            });
+          const expectedTrims = Object.values(redisPushes).map(value => value.length);
+          assert.equal(
+            _.sum(redisTrims),
+            _.sum(expectedTrims),
+          );
+
+        });
       });
 
       [{

@@ -6,21 +6,29 @@ import * as gristTypes from 'app/common/gristTypes';
 import {GristObjCode} from 'app/plugin/GristData';
 import {TableData} from 'app/common/TableData';
 import {ActiveDoc} from 'app/server/lib/ActiveDoc';
+import {CreatableArchiveFormats} from 'app/server/lib/Archive';
+import {getDocPoolIdFromDocInfo} from 'app/server/lib/AttachmentStore';
 import {AttachmentStoreProvider} from 'app/server/lib/AttachmentStoreProvider';
 import {DummyAuthorizer} from 'app/server/lib/Authorizer';
 import {Client} from 'app/server/lib/Client';
 import {makeExceptionalDocSession, OptDocSession} from 'app/server/lib/DocSession';
+import {guessExt} from 'app/server/lib/guessExt';
 import log from 'app/server/lib/log';
 import {timeoutReached} from 'app/server/lib/serverUtils';
 import {Throttle} from 'app/server/lib/Throttle';
+import {createTmpDir as createTmpUploadDir, globalUploadSet} from 'app/server/lib/uploads';
+import {MemoryWritableStream} from 'app/server/utils/streams';
 import {promisify} from 'bluebird';
 import {assert} from 'chai';
+import decompress from 'decompress';
 import * as child_process from 'child_process';
 import * as fse from 'fs-extra';
 import * as _ from 'lodash';
-import {resolve} from 'path';
+import * as stream from 'node:stream';
+import path,  /*path,*/ {resolve} from 'path';
 import * as sinon from 'sinon';
 import {createDocTools} from 'test/server/docTools';
+import {makeTestingFilesystemStoreConfig} from 'test/server/lib/FilesystemAttachmentStore';
 import * as testUtils from 'test/server/testUtils';
 import {EnvironmentSnapshot} from 'test/server/testUtils';
 import * as tmp from 'tmp';
@@ -31,13 +39,18 @@ const UNSUPPORTED_FORMULA: CellValue = [GristObjCode.Exception, 'Formula not sup
 
 tmp.setGracefulCleanup();
 
-describe('ActiveDoc', function() {
+describe('ActiveDoc', async function() {
   this.timeout(10000);
 
   // Turn off logging for this test, and restore afterwards.
   testUtils.setTmpLogLevel('warn');
 
-  const docTools = createDocTools();
+  const createAttachmentStoreProvider = async () => new AttachmentStoreProvider(
+    [await makeTestingFilesystemStoreConfig("filesystem")],
+    "TEST-INSTALLATION-UUID"
+  );
+
+  const docTools = createDocTools({ createAttachmentStoreProvider });
 
   const fakeSession = makeExceptionalDocSession('system');
 
@@ -1144,6 +1157,149 @@ describe('ActiveDoc', function() {
       assert.equal(url, docUrl);
       await activeDoc.shutdown();
     }
+  });
+
+  describe('attachments', async function() {
+    // Provides the fake userId `null`, so we can access uploaded files with hitting an
+    // authorization errors.
+    const fakeTransferSession = docTools.createFakeSession();
+
+    const testAttachments = [
+      {
+        name: "Test.doc",
+        contents: "Hello world!",
+      },
+      {
+        name: "Test2.txt",
+        contents: "I am a test file!",
+      },
+    ];
+
+    async function uploadAttachments(doc: ActiveDoc, files: {name: string, contents: string}[]) {
+      const { tmpDir, cleanupCallback } = await createTmpUploadDir({});
+
+      const uploadPromises = files.map(async (file) => {
+        const filePath = resolve(tmpDir, file.name);
+        const buffer = Buffer.from(file.contents, 'utf8');
+        await fse.writeFile(path.join(tmpDir, file.name), buffer);
+        return {
+          absPath: filePath,
+          origName: file.name,
+          size: buffer.length,
+          ext: await guessExt(filePath, file.name, null)
+        };
+      });
+
+      const uploadedFiles = await Promise.all(uploadPromises);
+      const uploadId = globalUploadSet.registerUpload(uploadedFiles, tmpDir, cleanupCallback, null);
+      await doc.addAttachments(fakeTransferSession, uploadId);
+    }
+
+    async function assertArchiveContents(
+      archive: string | Buffer,
+      archiveType: string,
+      expectedFiles: { name: string; contents?: string }[],
+    ) {
+      const getFileName = (filePath: string) => filePath.substring(filePath.indexOf("_") + 1);
+      const files = await decompress(archive);
+      for (const expectedFile of expectedFiles) {
+        const file = files.find((file) => getFileName(file.path) === expectedFile.name);
+        assert(file, "file not found in archive");
+        if (expectedFile.contents) {
+          assert.equal(
+            file?.data.toString(), expectedFile.contents, `file contents in ${archiveType} archive don't match`);
+        }
+      }
+    }
+
+    it('can pack attachments into an archive', async function() {
+      const docName = 'attachment-archive';
+      const activeDoc1 = await docTools.createDoc(docName);
+
+      await uploadAttachments(activeDoc1, testAttachments);
+
+      for (const archiveType of CreatableArchiveFormats.values) {
+        const archive = await activeDoc1.getAttachmentsArchive(fakeTransferSession, archiveType);
+        const archiveMemoryStream = new MemoryWritableStream();
+        await archive.packInto(archiveMemoryStream);
+
+        await assertArchiveContents(archiveMemoryStream.getBuffer(), archiveType, testAttachments);
+      }
+    });
+
+    it('can import missing attachments from an archive', async function() {
+      const docName = 'add-missing-attachments';
+      const activeDoc = await docTools.createDoc(docName);
+
+      const provider = docTools.getAttachmentStoreProvider();
+      const storeId = provider.listAllStoreIds()[0];
+
+      await activeDoc.setAttachmentStore(fakeSession, storeId);
+
+      await uploadAttachments(activeDoc, testAttachments);
+
+      const attachmentsArchive = await activeDoc.getAttachmentsArchive(fakeSession, "tar");
+      const attachmentsTarStream = new MemoryWritableStream();
+      await attachmentsArchive.packInto(attachmentsTarStream);
+      const attachmentsTar = attachmentsTarStream.getBuffer();
+
+      const store = (await provider.getStore(storeId))!;
+      // Purge any attachments related to this doc.
+      await store.removePool(getDocPoolIdFromDocInfo({ id: activeDoc.docName, trunkId: undefined }));
+
+      const result1 = await activeDoc.addMissingFilesFromArchive(fakeSession, stream.Readable.from(attachmentsTar));
+      assert.equal(result1.added, testAttachments.length, "all attachments should be added");
+
+      const result2 = await activeDoc.addMissingFilesFromArchive(fakeSession, stream.Readable.from(attachmentsTar));
+      assert.equal(result2.added, 0, "no attachments should be added");
+      assert.equal(result2.unused, testAttachments.length, "all attachments should be unused");
+    });
+
+    /*
+    it('can transfer attachments to a new store, with correct status reporting', async function() {
+      const docName = 'transfer status';
+      const activeDoc1 = await docTools.createDoc(docName);
+      await activeDoc1.applyUserActions(fakeSession, [
+        ['AddTable', 'MyAttachments', [{id: "A", type: allTypes.Attachments, isFormula: false}]],
+      ]);
+
+      const initialTransferStatus = activeDoc1.attachmentTransferStatus();
+      assert.isFalse(initialTransferStatus.isRunning);
+      assert.equal(initialTransferStatus.pendingTransferCount, 0);
+
+      const initialAttachmentsLocation = await activeDoc1.attachmentLocationSummary();
+      assert.equal(initialAttachmentsLocation, "NO FILES");
+
+      await uploadAttachments(activeDoc1, [{
+        name: "A.txt",
+        contents: "Contents1",
+      }]);
+
+      const postUploadAttachmentsLocation = await activeDoc1.attachmentLocationSummary();
+      assert.equal(postUploadAttachmentsLocation, "INTERNAL");
+
+      await activeDoc1.setAttachmentStore(fakeSession, attachmentStoreProvider.listAllStoreIds()[0]);
+      await activeDoc1.startTransferringAllAttachmentsToDefaultStore();
+
+      // These assertions should always be correct, as we don't await any promises here, so there's
+      // no time for the async transfers to run.
+      const transferStartedStatus = activeDoc1.attachmentTransferStatus();
+      assert.isTrue(transferStartedStatus.isRunning);
+      assert.isTrue(transferStartedStatus.pendingTransferCount > 0, "at least one transfer should be pending");
+
+      // Can't assert location here, as "INTERNAL", "MIXED" and "EXTERNAL" are all valid, depending
+      // on how the transfer status is going in the background.
+
+      await activeDoc1.allAttachmentTransfersCompleted();
+
+      const finalTransferStatus = activeDoc1.attachmentTransferStatus();
+      assert.isFalse(finalTransferStatus.isRunning);
+      assert.equal(finalTransferStatus.pendingTransferCount, 0);
+
+      const finalAttachmentsLocation = await activeDoc1.attachmentLocationSummary();
+      assert(finalAttachmentsLocation, "INTERNAL");
+    });
+    */
   });
 });
 

@@ -1,5 +1,8 @@
-import {FilesystemAttachmentStore} from 'app/server/lib/AttachmentStore';
-import {MemoryWritableStream} from 'app/server/utils/MemoryWritableStream';
+import {
+  FilesystemAttachmentStore,
+  loadAttachmentFileIntoMemory
+} from 'app/server/lib/AttachmentStore';
+import {IAttachmentStoreConfig} from 'app/server/lib/AttachmentStoreProvider';
 import {createTmpDir} from 'test/server/docTools';
 
 import {assert} from 'chai';
@@ -31,6 +34,15 @@ export async function makeTestingFilesystemStoreSpec(
   };
 }
 
+export async function makeTestingFilesystemStoreConfig(
+  name: string = "test-filesystem"
+): Promise<IAttachmentStoreConfig> {
+  return {
+    label: name,
+    spec: await makeTestingFilesystemStoreSpec(name),
+  };
+}
+
 describe('FilesystemAttachmentStore', () => {
   it('can upload a file', async () => {
     const spec = await makeTestingFilesystemStoreSpec();
@@ -46,10 +58,10 @@ describe('FilesystemAttachmentStore', () => {
     const store = await spec.create("test-filesystem-store");
     await store.upload(testingDocPoolId, testingFileId, getTestingFileAsReadableStream());
 
-    const outputBuffer = new MemoryWritableStream();
-    await store.download(testingDocPoolId, testingFileId, outputBuffer);
+    const download = await store.download(testingDocPoolId, testingFileId);
+    const file = await loadAttachmentFileIntoMemory(download);
 
-    assert.equal(outputBuffer.getBuffer().toString(), testingFileContents, "file contents do not match");
+    assert.equal(file.contents.toString(), testingFileContents, "file contents do not match");
   });
 
   it('can check if a file exists', async () => {
@@ -59,6 +71,17 @@ describe('FilesystemAttachmentStore', () => {
     assert.isFalse(await store.exists(testingDocPoolId, testingFileId));
     await store.upload(testingDocPoolId, testingFileId, getTestingFileAsReadableStream());
     assert.isTrue(await store.exists(testingDocPoolId, testingFileId));
+  });
+
+  it('can delete a file', async () => {
+    const spec = await makeTestingFilesystemStoreSpec();
+    const store = await spec.create("test-filesystem-store");
+
+    assert.isFalse(await store.exists(testingDocPoolId, testingFileId));
+    await store.upload(testingDocPoolId, testingFileId, getTestingFileAsReadableStream());
+    assert.isTrue(await store.exists(testingDocPoolId, testingFileId));
+    await store.delete(testingDocPoolId, testingFileId);
+    assert.isFalse(await store.exists(testingDocPoolId, testingFileId));
   });
 
   it('can remove an entire pool', async () => {

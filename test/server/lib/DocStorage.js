@@ -72,80 +72,89 @@ describe('DocStorage', function() {
       return Promise.all(tableNames.map(t => docStorage.fetchTable(t)));
     }
 
-    it('should allow reading without modifying mtime', function() {
-      let doc, docName;
+    it('should allow reading without modifying mtime', async function() {
       let pastTime = new Date('2016/1/1');
 
-      return testUtils.useFixtureDoc('Hello.grist', docStorageManager)
-      .then(_docName => docName = _docName)
-      // On Windows, utimes() is strangely unreliable but works when stat() is called first.
-      .then(() => fs.statAsync(docStorageManager.getPath(docName)))
-      .then(() => fs.utimesAsync(docStorageManager.getPath(docName), pastTime, pastTime))
-      .then(() => {
-        doc = new DocStorage(docStorageManager, docName);
-        return doc.openFile();
-      })
-      .then(() => fetchAllTables(doc))  // Should not touch mtime, even after shutdown.
-      .then(() => doc.shutdown())
-      .then(() => fs.statAsync(docStorageManager.getPath(docName)))
-      .then(stats => {
+      const docName = await testUtils.useFixtureDoc('Hello.grist', docStorageManager);
+      const doc = new DocStorage(docStorageManager, docName);
+      try {
+        // In WAL mode, the db file is touched initially to go into WAL mode,
+        // it is a property of the database file not just the connection.
+        // So we do an extra close-open cycle.
+        await doc.openFile();
+        await doc.shutdown();
+        // On Windows, utimes() is strangely unreliable but works when stat() is called first.
+        await fs.statAsync(docStorageManager.getPath(docName));
+        await fs.utimesAsync(docStorageManager.getPath(docName), pastTime, pastTime);
+        await doc.openFile();
+        await fetchAllTables(doc);  // Should not touch mtime, even after shutdown.
+        await doc.shutdown();
+        let stats = await fs.statAsync(docStorageManager.getPath(docName));
         assert.equal(pastTime.getTime(), stats.mtime.getTime());
-      })
-      // Try again, but this time actually make a change.
-      .then(() => doc.openFile())
-      .then(() => doc.applyStoredActions([['UpdateRecord', 'Table1', 2, {A: 'poke!'}]]))
-      .then(() => fs.statAsync(docStorageManager.getPath(docName)))
-      .then(stats => {
+        // Try again, but this time actually make a change.
+        await doc.openFile();
+        await doc.applyStoredActions([['UpdateRecord', 'Table1', 2, {A: 'poke!'}]]);
+        await doc.shutdown();
+        stats = await fs.statAsync(docStorageManager.getPath(docName));
         assert.isBelow(pastTime.getTime(), stats.mtime.getTime());
-      })
-      .finally(() => doc.shutdown());
+      } finally {
+        await doc.shutdown();
+      }
     });
 
-    it('should allow reading but not writing a read-only file', function() {
-      let doc, docName;
+    it('should allow reading but not writing a read-only file', async function() {
+      if (process.env.GRIST_SQLITE_MODE === 'wal') {
+        // Doesn't really make sense in WAL mode.
+        this.skip();
+      }
+
       let pastTime = new Date('2016/1/1');
 
-      return testUtils.useFixtureDoc('Hello.grist', docStorageManager)
-      .then(_docName => docName = _docName)
+      const docName = await testUtils.useFixtureDoc('Hello.grist', docStorageManager);
       // On Windows, utimes() is strangely unreliable but works when stat() is called first.
-      .then(() => fs.statAsync(docStorageManager.getPath(docName)))
-      .then(() => fs.utimesAsync(docStorageManager.getPath(docName), pastTime, pastTime))
-      .then(() => fs.chmodAsync(docStorageManager.getPath(docName), 0o400))
-      .then(() => {
-        doc = new DocStorage(docStorageManager, docName);
-        return doc.openFile();
-      })
-      .then(() => fetchAllTables(doc)) // Should not touch mtime
-      .then(() => testUtils.expectRejection(
-        doc.execTransaction(db => db.exec("CREATE TABLE 'test' ('test' TEXT)")),
-        'SQLITE_READONLY'))
-      .then(() => fs.statAsync(docStorageManager.getPath(docName)))
-      .then(stats => {
+      await fs.statAsync(docStorageManager.getPath(docName));
+      await fs.utimesAsync(docStorageManager.getPath(docName), pastTime, pastTime);
+      await fs.chmodAsync(docStorageManager.getPath(docName), 0o400);
+      const doc = new DocStorage(docStorageManager, docName);
+      await doc.openFile();
+      try {
+        await fetchAllTables(doc); // Should not touch mtime
+        await testUtils.expectRejection(
+          doc.execTransaction(db => db.exec("CREATE TABLE 'test' ('test' TEXT)")),
+          'SQLITE_READONLY'
+        );
+        const stats = await fs.statAsync(docStorageManager.getPath(docName));
         assert.equal(pastTime.getTime(), stats.mtime.getTime());
-      })
-      .finally(() => doc.shutdown());
+      } finally {
+        await doc.shutdown();
+      }
     });
 
-    it('should allow writing', function() {
-      let doc, docName;
+    it('should allow writing', async function() {
       let pastTime = new Date('2016/1/1');
 
-      return testUtils.useFixtureDoc('Hello.grist', docStorageManager)
-      .then(_docName => docName = _docName)
-      // On Windows, utimes() is strangely unreliable but works when stat() is called first.
-      .then(() => fs.statAsync(docStorageManager.getPath(docName)))
-      .then(() => fs.utimesAsync(docStorageManager.getPath(docName), pastTime, pastTime))
-      .then(() => {
-        doc = new DocStorage(docStorageManager, docName);
-        return doc.openFile();
-      })
-      // Should touch mtime
-      .then(() => doc.execTransaction(db => db.exec("CREATE TABLE 'test' ('test' TEXT)")))
-      .then(() => fs.statAsync(docStorageManager.getPath(docName)))
-      .then(stats => {
+      const docName = await testUtils.useFixtureDoc('Hello.grist', docStorageManager)
+      const doc = new DocStorage(docStorageManager, docName);
+      // before measuring stats, open/close for WAL mode.
+      await doc.openFile();
+      try {
+        await doc.shutdown();
+        // On Windows, utimes() is strangely unreliable but works when stat() is called first.
+        await fs.statAsync(docStorageManager.getPath(docName));
+        await fs.utimesAsync(docStorageManager.getPath(docName), pastTime, pastTime);
+        await doc.openFile();
+
+        // Should touch mtime
+        await doc.execTransaction(db => db.exec("CREATE TABLE 'test' ('test' TEXT)"));
+        // Need to shutdown before impact in WAL mode
+        if (process.env.GRIST_SQLITE_MODE === 'wal') {
+          await doc.shutdown();
+        }
+        const stats = await fs.statAsync(docStorageManager.getPath(docName));
         assert.isBelow(pastTime.getTime(), stats.mtime.getTime());
-      })
-      .finally(() => doc.shutdown());
+      } finally {
+        await doc.shutdown();
+      }
     });
 
   });
@@ -385,22 +394,29 @@ describe('DocStorage', function() {
     });
   });
 
-  describe('findOrAttachFile', function() {
+  describe('attachFileIfNew', function() {
     var docStorage;
     it("should create attachment blob", function() {
       docStorage = new DocStorage(docStorageManager, 'test_Attachments');
       const correctFileContents = "Hello, world!"
+      const replacementFileContents = "Another file"
       return docStorage.createFile()
-      .then(() => docStorage.findOrAttachFile( "hello_world.txt", Buffer.from(correctFileContents)))
+      .then(() => docStorage.attachFileIfNew( "hello_world.txt", Buffer.from(correctFileContents)))
       .then(result => assert.isTrue(result))
       .then(() => docStorage.getFileInfo("hello_world.txt"))
       .then(fileInfo => assert.equal(fileInfo.data.toString('utf8'), correctFileContents))
 
       // If we use the same fileIdent for another file, it should not get attached.
-      .then(() => docStorage.findOrAttachFile("hello_world.txt", Buffer.from("Another file")))
+      .then(() => docStorage.attachFileIfNew("hello_world.txt", Buffer.from(replacementFileContents)))
       .then(result => assert.isFalse(result))
       .then(() => docStorage.getFileInfo("hello_world.txt"))
-      .then(fileInfo => assert.equal(fileInfo.data.toString('utf8'), correctFileContents));
+      .then(fileInfo => assert.equal(fileInfo.data.toString('utf8'), correctFileContents))
+
+      // The update parameter should allow the record to be overwritten
+      .then(() => docStorage.attachOrUpdateFile("hello_world.txt", Buffer.from(replacementFileContents), undefined))
+      .then(result => assert.isFalse(result))
+      .then(() => docStorage.getFileInfo("hello_world.txt"))
+      .then(fileInfo => assert.equal(fileInfo.data.toString('utf8'), replacementFileContents));
     });
   });
 
@@ -889,6 +905,9 @@ describe('DocStorage', function() {
       // Check that only the 2 most recent actions remain. Ignore the last action, which
       // includes the formula calculations created during stored-formulas migration.
       assert.deepEqual(recentActions.slice(0, -1).map(filterAction), actions.slice(-2));
+      if (process.env.GRIST_SQLITE_MODE === 'wal') {
+        await activeDoc.shutdown();
+      }
       stat = await fs.statAsync(docStorage.docPath);
       // Check that the size is smaller (VACUUM should have been called after deletion).
       assert(stat.size < originalSize);

@@ -9,6 +9,7 @@ import {sanitizeHttpUrl} from 'app/client/lib/sanitizeUrl';
 import {ColumnRec, ViewSectionRec} from 'app/client/models/DocModel';
 import {reportError} from 'app/client/models/errors';
 import {gristThemeObs} from 'app/client/ui2018/theme';
+import {convertThemeKeysToCssVars} from 'app/common/ThemePrefs';
 import {AccessLevel, ICustomWidget, isSatisfied, matchWidget} from 'app/common/CustomWidget';
 import {DisposableWithEvents} from 'app/common/DisposableWithEvents';
 import {BulkColValues, fromTableDataAction, RowRecord} from 'app/common/DocActions';
@@ -77,9 +78,9 @@ export interface WidgetFrameOptions {
    */
   configure?: (frame: WidgetFrame) => void;
   /**
-   * Optional handler to modify the iframe.
+   * Handler to modify the iframe.
    */
-  onElem?: (iframe: HTMLIFrameElement) => void;
+  onElem: (iframe: HTMLIFrameElement) => void;
   /**
    * Optional language to use for the widget.
    */
@@ -211,16 +212,17 @@ export class WidgetFrame extends DisposableWithEvents {
   }
 
   public buildDom() {
-    const onElem = this._options.onElem ?? ((el: HTMLIFrameElement) => el);
     this._iframe = dom(
       'iframe',
       dom.style('visibility', use => use(this._visible) ? 'visible' : 'hidden'),
       dom.cls('clipboard_focus'),
       dom.cls('custom_view'),
       dom.attr('src', this._url),
+      // Allow widgets to write to the clipboard via the Clipboard API.
+      {allow: "clipboard-write"},
       hooks.iframeAttributes,
       testId('ready', use => use(this._readyCalled) && !use(this._isEmpty)),
-      self => void onElem(self),
+      (elem) => { this._options.onElem(elem); },
     );
     return this._iframe;
   }
@@ -726,7 +728,7 @@ export class ThemeNotifier extends BaseEventSource {
     if (this.isDisposed()) { return; }
 
     this._notify({
-      theme: gristThemeObs().get(),
+      theme: convertThemeKeysToCssVars(gristThemeObs().get()),
       fromReady,
     });
   }

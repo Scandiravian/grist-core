@@ -1,5 +1,6 @@
 import * as commands from 'app/client/components/commands';
 import {makeT} from 'app/client/lib/localization';
+import {cssMarkdownSpan} from 'app/client/lib/markdown';
 import {buildHighlightedCode} from 'app/client/ui/CodeHighlight';
 import {ShortcutKey, ShortcutKeyContent} from 'app/client/ui/ShortcutKey';
 import {icon} from 'app/client/ui2018/icons';
@@ -46,7 +47,11 @@ export type Tooltip =
   | 'communityWidgets'
   | 'twoWayReferences'
   | 'twoWayReferencesDisabled'
-  | 'reasignTwoWayReference';
+  | 'viewAsBanner'
+  | 'reassignTwoWayReference'
+  | 'attachmentStorage'
+  | 'adminControls'
+  ;
 
 export type TooltipContentFunc = (...domArgs: DomElementArg[]) => DomContents;
 
@@ -178,7 +183,7 @@ see or edit which parts of your document.')
     ),
     ...args,
   ),
-  reasignTwoWayReference: (...args: DomElementArg[]) => cssTooltipContent(
+  reassignTwoWayReference: (...args: DomElementArg[]) => cssTooltipContent(
     dom('div',
       t('This limitation occurs when one column in a two-way reference has the Reference type.')
     ),
@@ -187,6 +192,46 @@ see or edit which parts of your document.')
     ),
     ...args,
   ),
+  viewAsBanner: (...args: DomElementArg[]) => cssTooltipContent(
+    dom('div', t('The preview below this header shows how the selected user will see this document')),
+    ...args,
+  ),
+  attachmentStorage: (...args: DomElementArg[]) => cssTooltipContent(
+    cssMarkdownSpan(
+      t(
+        "Internal storage means all attachments are stored in the document SQLite file, " +
+        "while external storage indicates all attachments are stored in the same " +
+        "external storage."
+      ) +
+      "\n\n" +
+      t(
+      "[Learn more.]({{link}})", {
+        link: commonUrls.attachmentStorage
+      }
+    )),
+    ...args,
+  ),
+  adminControls: (...args: DomElementArg[]) => cssTooltipContent(
+    dom('div', t('Manage users and resources in a Grist installation.')),
+    dom('div', cssLink({href: commonUrls.helpAdminControls, target: "_blank"}, t('Learn more.'))),
+    ...args,
+  ),
+};
+
+type ErrorTooltip = 'summaryFormulas';
+
+export const ErrorTooltips: Record<ErrorTooltip, TooltipContentFunc> = {
+  summaryFormulas: () =>
+    cssTooltipContent(
+      dom("div", t("Summary tables can only contain formula columns.")),
+      dom(
+        "div",
+        cssLink(
+          {href: commonUrls.helpSummaryFormulas, target: "_blank"},
+          t("Learn more.")
+        )
+      ),
+    ),
 };
 
 export interface BehavioralPromptContent {

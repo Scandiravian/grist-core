@@ -6,10 +6,13 @@ import {AdminChecks, probeDetails, ProbeDetails} from 'app/client/models/AdminCh
 import {AppModel, getHomeUrl, reportError} from 'app/client/models/AppModel';
 import {AuditLogsModel} from 'app/client/models/AuditLogsModel';
 import {urlState} from 'app/client/models/gristUrlState';
-import {AppHeader} from 'app/client/ui/AppHeader';
+import {showEnterpriseToggle} from 'app/client/ui/ActivationPage';
+import {buildAdminData} from 'app/client/ui/AdminControls';
+import {buildAdminLeftPanel, getPageNames} from 'app/client/ui/AdminLeftPanel';
+import {AdminSection, AdminSectionItem, cssValueLabel, HidableToggle} from 'app/client/ui/AdminPanelCss';
+import {getAdminPanelName} from 'app/client/ui/AdminPanelName';
 import {AuditLogStreamingConfig, getDestinationDisplayName} from 'app/client/ui/AuditLogStreamingConfig';
 import {InstallConfigsAPI} from 'app/client/ui/ConfigsAPI';
-import {leftPanelBasic} from 'app/client/ui/LeftPanelCommon';
 import {pagePanels} from 'app/client/ui/PagePanels';
 import {SupportGristPage} from 'app/client/ui/SupportGristPage';
 import {ToggleEnterpriseWidget} from 'app/client/ui/ToggleEnterpriseWidget';
@@ -20,28 +23,81 @@ import {toggle} from 'app/client/ui2018/checkbox';
 import {mediaSmall, testId, theme, vars} from 'app/client/ui2018/cssVars';
 import {cssLink, makeLinks} from 'app/client/ui2018/links';
 import {BootProbeInfo, BootProbeResult, SandboxingBootProbeDetails} from 'app/common/BootProbe';
-import {commonUrls, getPageTitleSuffix} from 'app/common/gristUrls';
+import {AdminPanelPage, commonUrls, getPageTitleSuffix} from 'app/common/gristUrls';
 import {InstallAPI, InstallAPIImpl, LatestVersion} from 'app/common/InstallAPI';
 import {naturalCompare} from 'app/common/SortFunc';
 import {getGristConfig} from 'app/common/urlUtils';
 import * as version from 'app/common/version';
-import {Computed, Disposable, dom, IDisposable,
-        IDisposableOwner, MultiHolder, Observable, styled} from 'grainjs';
-import {AdminSection, AdminSectionItem, HidableToggle} from 'app/client/ui/AdminPanelCss';
-import {getAdminPanelName} from 'app/client/ui/AdminPanelName';
-import {showEnterpriseToggle} from 'app/client/ui/ActivationPage';
+import {Computed, Disposable, dom, IDisposable, MultiHolder, Observable, styled} from 'grainjs';
 
 const t = makeT('AdminPanel');
 
 export class AdminPanel extends Disposable {
+  private _page = Computed.create<AdminPanelPage>(this, (use) => use(urlState().state).adminPanel || 'admin');
+
+  constructor(private _appModel: AppModel) {
+    super();
+    document.title = getAdminPanelName() + getPageTitleSuffix(getGristConfig());
+  }
+
+  public buildDom() {
+    const pageObs = Computed.create(this, use => use(urlState().state).adminPanel || 'admin');
+    return pagePanels({
+      leftPanel: buildAdminLeftPanel(this, this._appModel),
+      headerMain: this._buildMainHeader(pageObs),
+      contentTop: buildHomeBanners(this._appModel),
+      contentMain: this._buildMainContent(),
+    });
+  }
+
+
+  private _buildMainHeader(pageObs: Computed<AdminPanelPage>) {
+    const pageNames = getPageNames();
+    return [
+      cssBreadcrumbs({style: 'margin-left: 16px;'},
+        cssLink(
+          urlState().setLinkUrl({}),
+          t('Grist Instance'),
+        ),
+        separator(' / '),
+        dom('span', getAdminPanelName()),
+        separator(' / '),
+        dom('span', dom.domComputed(use => pageNames.pages[use(pageObs)].section)),
+        separator(' / '),
+        dom('span', dom.domComputed(use => pageNames.pages[use(pageObs)].name)),
+      ),
+      createTopBarHome(this._appModel),
+    ];
+  }
+
+  private _buildMainContent() {
+    return cssPageContainer(
+      // Setting tabIndex allows selecting and copying text. This is helpful on admin pages, e.g.
+      // to copy GRIST_BOOT_KEY or version number. But we don't set it for buidAdminData() pages
+      // because it messes with focus in GridViews, and its unclear how to undo its effect.
+      dom.attr('tabindex', use => use(this._page) === 'admin' ? '-1' : null as any),
+
+      dom.domComputed(use => use(this._page) === 'admin', (isInstallationAdminPage) => {
+        return isInstallationAdminPage ?
+          dom.create(AdminInstallationPanel, this._appModel) :
+          dom.create(buildAdminData, this._appModel);
+      }),
+
+      cssPageContainer.cls('-admin-pages', use => use(this._page) !== 'admin'),
+
+      testId('admin-panel'),
+    );
+  }
+}
+
+class AdminInstallationPanel extends Disposable {
   private _supportGrist = SupportGristPage.create(this, this._appModel);
-  private _toggleEnterprise = ToggleEnterpriseWidget.create(this);
+  private _toggleEnterprise = ToggleEnterpriseWidget.create(this, this._appModel.notifier);
   private readonly _installAPI: InstallAPI = new InstallAPIImpl(getHomeUrl());
   private _checks: AdminChecks;
 
   constructor(private _appModel: AppModel) {
     super();
-    document.title = getAdminPanelName() + getPageTitleSuffix(getGristConfig());
     this._checks = new AdminChecks(this, this._installAPI);
   }
 
@@ -49,56 +105,22 @@ export class AdminPanel extends Disposable {
     this._checks.fetchAvailableChecks().catch(err => {
       reportError(err);
     });
-    const panelOpen = Observable.create(this, false);
-    return pagePanels({
-      leftPanel: {
-        panelWidth: Observable.create(this, 240),
-        panelOpen,
-        hideOpener: true,
-        header: dom.create(AppHeader, this._appModel),
-        content: leftPanelBasic(this._appModel, panelOpen),
-      },
-      headerMain: this._buildMainHeader(),
-      contentTop: buildHomeBanners(this._appModel),
-      contentMain: dom.create(this._buildMainContent.bind(this)),
-    });
-  }
 
-  private _buildMainHeader() {
-    return dom.frag(
-      cssBreadcrumbs({style: 'margin-left: 16px;'},
-        cssLink(
-          urlState().setLinkUrl({}),
-          t('Home'),
-        ),
-        separator(' / '),
-        dom('span', getAdminPanelName()),
-      ),
-      createTopBarHome(this._appModel),
-    );
-  }
-
-  private _buildMainContent(owner: MultiHolder) {
     // If probes are available, show the panel as normal.
     // Otherwise say it is unavailable, and describe a fallback
     // mechanism for access.
-    return cssPageContainer(
-      dom.cls('clipboard'),
-      {tabIndex: "-1"},
-      dom.maybe(this._checks.probes, probes => {
-        return probes.length > 0
-            ? this._buildMainContentForAdmin(owner)
-            : this._buildMainContentForOthers(owner);
-      }),
-      testId('admin-panel'),
-    );
+    return dom.maybe(use => use(this._checks.probes), (probes) => [
+      (probes as any[]).length > 0
+      ? this._buildMainContentForAdmin()
+      : this._buildMainContentForOthers()
+    ]);
   }
 
   /**
    * Show something helpful to those without access to the panel,
-   * which could include a legit adminstrator if auth is misconfigured.
+   * which could include a legit administrator if auth is misconfigured.
    */
-  private _buildMainContentForOthers(owner: MultiHolder) {
+  private _buildMainContentForOthers() {
     const exampleKey = _longCodeForExample();
     return dom.create(AdminSection, t('Administrator Panel Unavailable'), [
       dom('p', t(`You do not have access to the administrator panel.
@@ -114,7 +136,7 @@ Please log in as an administrator.`)),
     ]);
   }
 
-  private _buildMainContentForAdmin(owner: MultiHolder) {
+  private _buildMainContentForAdmin() {
     return [
       dom.create(AdminSection, t('Support Grist'), [
         dom.create(AdminSectionItem, {
@@ -137,22 +159,22 @@ Please log in as an administrator.`)),
           id: 'sandboxing',
           name: t('Sandboxing'),
           description: t('Sandbox settings for data engine'),
-          value: this._buildSandboxingDisplay(owner),
+          value: this._buildSandboxingDisplay(),
           expandedContent: this._buildSandboxingNotice(),
         }),
         dom.create(AdminSectionItem, {
           id: 'authentication',
           name: t('Authentication'),
           description: t('Current authentication method'),
-          value: this._buildAuthenticationDisplay(owner),
-          expandedContent: this._buildAuthenticationNotice(owner),
+          value: this._buildAuthenticationDisplay(),
+          expandedContent: this._buildAuthenticationNotice(),
         }),
         dom.create(AdminSectionItem, {
           id: 'session',
           name: t('Session Secret'),
           description: t('Key to sign sessions with'),
-          value: this._buildSessionSecretDisplay(owner),
-          expandedContent: this._buildSessionSecretNotice(owner),
+          value: this._buildSessionSecretDisplay(),
+          expandedContent: this._buildSessionSecretNotice(),
         })
       ]),
       this._buildAuditLogsSection(),
@@ -164,10 +186,10 @@ Please log in as an administrator.`)),
           value: cssValueLabel(`Version ${version.version}`),
         }),
         this._maybeAddEnterpriseToggle(),
-        this._buildUpdates(owner),
+        dom.create(this._buildUpdates.bind(this)),
       ]),
       dom.create(AdminSection, t('Self Checks'), [
-        this._buildProbeItems(owner, {
+        this._buildProbeItems({
           showRedundant: false,
           showNovel: true,
         }),
@@ -176,7 +198,7 @@ Please log in as an administrator.`)),
           name: 'more...',
           description: '',
           value: '',
-          expandedContent: this._buildProbeItems(owner, {
+          expandedContent: this._buildProbeItems({
             showRedundant: true,
             showNovel: false,
           }),
@@ -186,19 +208,28 @@ Please log in as an administrator.`)),
   }
 
   private _maybeAddEnterpriseToggle() {
+
     if (!showEnterpriseToggle()) {
       return null;
     }
+
+    let makeToggle = () => dom.create(HidableToggle, this._toggleEnterprise.getEnterpriseToggleObservable());
+
+    // If the enterprise edition is forced, we don't show the toggle.
+    if (getGristConfig().forceEnableEnterprise) {
+      makeToggle = () => cssValueLabel(cssHappyText(t("On")));
+    }
+
     return dom.create(AdminSectionItem, {
       id: 'enterprise',
       name: t('Enterprise'),
       description: t('Enable Grist Enterprise'),
-      value: dom.create(HidableToggle, this._toggleEnterprise.getEnterpriseToggleObservable()),
+      value: makeToggle(),
       expandedContent: this._toggleEnterprise.buildEnterpriseSection(),
     });
   }
 
-  private _buildSandboxingDisplay(owner: IDisposableOwner) {
+  private _buildSandboxingDisplay() {
     return dom.domComputed(
       use => {
         const req = this._checks.requestCheckById(use, 'sandboxing');
@@ -235,7 +266,7 @@ Please log in as an administrator.`)),
     ];
   }
 
-  private _buildAuthenticationDisplay(owner: IDisposableOwner) {
+  private _buildAuthenticationDisplay() {
     return dom.domComputed(
       use => {
         const req = this._checks.requestCheckById(use, 'authentication');
@@ -261,13 +292,13 @@ Please log in as an administrator.`)),
     );
   }
 
-  private _buildAuthenticationNotice(owner: IDisposableOwner) {
+  private _buildAuthenticationNotice() {
     return t('Grist allows different types of authentication to be configured, including SAML and OIDC. \
 We recommend enabling one of these if Grist is accessible over the network or being made available \
 to multiple people.');
   }
 
-  private _buildSessionSecretDisplay(owner: IDisposableOwner) {
+  private _buildSessionSecretDisplay() {
     return dom.domComputed(
       use => {
         const req = this._checks.requestCheckById(use, 'session-secret');
@@ -282,7 +313,7 @@ to multiple people.');
     );
   }
 
-  private _buildSessionSecretNotice(owner: IDisposableOwner) {
+  private _buildSessionSecretNotice() {
     return t('Grist signs user session cookies with a secret key. Please set this key via the environment variable \
 GRIST_SESSION_SECRET. Grist falls back to a hard-coded default when it is not set. We may remove this notice \
 in the future as session IDs generated since v1.1.16 are inherently cryptographically secure.');
@@ -476,20 +507,17 @@ in the future as session IDs generated since v1.1.16 are inherently cryptographi
           throw new Error('Invalid state');
         })
       ),
-      expandedContent: cssColumns(
-        cssColumn(
-          cssColumn.cls('-left'),
+      expandedContent: dom('div',
+        cssExpandedContent(
           dom('div', t('Grist releases are at '), makeLinks(releaseURL)),
-          dom.maybe(lastCheckDate, ms => dom('div',
+        ),
+        dom.maybe(lastCheckDate, ms => cssExpandedContent(
+          dom('div',
             dom('span', t('Last checked {{time}}', {time: getTimeFromNow(ms)})),
             dom('span', ' '),
             // Format date in local format.
             cssGrayed(new Date(ms).toLocaleString()),
-          )),
-          dom('div', t('Auto-check when this page loads')),
-        ),
-        cssColumn(
-          cssColumn.cls('-right'),
+          ),
           // `Check now` button, only shown when auto checks are enabled and we are not in the
           // middle of checking. Otherwise the button is shown in the summary row, and there is
           // no need to duplicate it.
@@ -500,8 +528,11 @@ in the future as session IDs generated since v1.1.16 are inherently cryptographi
               dom.on('click', actions.checkForUpdates),
               dom.prop('disabled', use => use(state) === State.CHECKING),
             ),
-          ]),
-          toggle(enabledController, testId('admin-panel-updates-auto-check')),
+          ])
+        )),
+        cssExpandedContent(
+          dom('span', t('Auto-check when this page loads')),
+          dom( 'div', toggle(enabledController, testId('admin-panel-updates-auto-check'))),
         ),
       )
     });
@@ -512,7 +543,7 @@ in the future as session IDs generated since v1.1.16 are inherently cryptographi
    * "redundant" (already covered elsewhere in the Admin Panel) and the
    * remainder are "novel".
    */
-  private _buildProbeItems(owner: MultiHolder, options: {
+  private _buildProbeItems(options: {
     showRedundant: boolean,
     showNovel: boolean,
   }) {
@@ -527,7 +558,7 @@ in the future as session IDs generated since v1.1.16 are inherently cryptographi
           const show = isRedundant ? options.showRedundant : options.showNovel;
           if (!show) { return null; }
           const req = this._checks.requestCheck(probe);
-          return this._buildProbeItem(owner, req.probe, use(req.result), req.details);
+          return this._buildProbeItem(req.probe, use(req.result), req.details);
         }),
       ]
     );
@@ -536,8 +567,7 @@ in the future as session IDs generated since v1.1.16 are inherently cryptographi
   /**
    * Show the result of an individual check.
    */
-  private _buildProbeItem(owner: MultiHolder,
-                          info: BootProbeInfo,
+  private _buildProbeItem(info: BootProbeInfo,
                           result: BootProbeResult,
                           details: ProbeDetails|undefined) {
 
@@ -696,10 +726,19 @@ const cssStatus = styled('div', `
 `);
 
 const cssPageContainer = styled('div', `
+  flex: 1;
+  display: flex;
+  flex-direction: column;
   overflow: auto;
   padding: 40px;
   font-size: ${vars.introFontSize};
   color: ${theme.text};
+  outline: none;
+
+  &-admin-pages {
+    padding: 12px;
+    font-size: ${vars.mediumFontSize};
+  }
 
   @media ${mediaSmall} {
     & {
@@ -709,42 +748,12 @@ const cssPageContainer = styled('div', `
   }
 `);
 
-
-export const cssValueLabel = styled('div', `
-  padding: 4px 8px;
-  color: ${theme.text};
-  border: 1px solid ${theme.inputBorder};
-  border-radius: ${vars.controlBorderRadius};
-`);
-
-// A wrapper for the version details panel. Shows two columns.
-// First grows as needed, second shrinks as needed and is aligned to the bottom.
-const cssColumns = styled('div', `
+const cssExpandedContent = styled('div', `
   display: flex;
-  align-items: flex-end;
-  & > div:first-child {
-    flex-grow: 1;
-    flex-shrink: 0;
-  }
-  & > div:last-child {
-    flex-shrink: 1;
-  }
-`);
-
-const cssColumn = styled('div', `
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  flex-grow: 1;
-  flex-shrink: 1;
-  margin-block: 1px; /* otherwise toggle is squashed: TODO: -1px in toggle looks like a bug */
-  &-left {
-    align-items: flex-start;
-  }
-  &-right {
-    align-items: flex-end;
-    justify-content: flex-end;
-  }
+  justify-content: space-between;
+  margin-right: 8px;
+  margin-bottom: 1rem;
+  align-items: center;
 `);
 
 const cssValueButton = styled('div', `
@@ -765,7 +774,7 @@ const cssErrorText = styled('span', `
   color: ${theme.errorText};
 `);
 
-export const cssDangerText = styled('div', `
+const cssDangerText = styled('div', `
   color: ${theme.dangerText};
 `);
 
@@ -773,7 +782,7 @@ const cssHappyText = styled('span', `
   color: ${theme.controlFg};
 `);
 
-export const cssLabel = styled('div', `
+const cssLabel = styled('div', `
   display: inline-block;
   min-width: 100px;
   text-align: right;

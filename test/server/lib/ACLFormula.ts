@@ -170,6 +170,51 @@ describe('ACLFormula', function() {
     assert.equal(compiled({user: new User({}), rec: V({A: null, B: 0})}), true);
   });
 
+  it('should handle the supported string methods', async function() {
+    let compiled = await setAndCompile("rec.A.lower() == rec.B");
+    assert.equal(compiled({user: new User({}), rec: V({A: "foo", B: "foo"})}), true);
+    assert.equal(compiled({user: new User({}), rec: V({A: "FoO", B: "foo"})}), true);
+    assert.equal(compiled({user: new User({}), rec: V({A: "Foo", B: "foo"})}), true);
+    assert.equal(compiled({user: new User({}), rec: V({A: "bar", B: "foo"})}), false);
+    assert.equal(compiled({user: new User({}), rec: V({A: " foo ", B: "foo"})}), false);
+    assert.equal(compiled({user: new User({}), rec: V({A: "foo", B: "Foo"})}), false);
+    assert.equal(compiled({user: new User({}), rec: V({A: "Foo", B: "Foo"})}), false);
+
+    compiled = await setAndCompile("user.email.upper() in [rec.A.upper()]");
+    assert.equal(compiled({user: new User({email: 'Foo@'}), rec: V({A: "foo@"})}), true);
+    assert.equal(compiled({user: new User({email: 'fOo@'}), rec: V({A: "FOo@"})}), true);
+    assert.equal(compiled({user: new User({email: 'foo@'}), rec: V({A: "bar@"})}), false);
+    assert.equal(compiled({user: new User({email: 'foo@'}), rec: V({A: "foo"})}), false);
+    assert.equal(compiled({user: new User({email: 'x1/Y2'}), rec: V({A: "X1/y2"})}), true);
+    assert.equal(compiled({user: new User({email: ''}), rec: V({A: "foo"})}), false);
+  });
+
+  it('should show reasonable errors for unsupported methods and functions', async function() {
+    let compiled = await setAndCompile("rec.lower() == rec.B");
+    assert.throws(() => compiled({user: new User({}), rec: V({A: "foo", B: "foo"})}),
+      /Not a function: 'rec.lower'/);
+
+    compiled = await setAndCompile("rec.A.capitalize() == rec.B");
+    assert.throws(() => compiled({user: new User({}), rec: V({A: "foo", B: "foo"})}),
+      /Not a function: 'rec.A.capitalize'/);
+
+    compiled = await setAndCompile("rec.A.lower() == rec.B");
+    assert.throws(() => compiled({user: new User({}), rec: V({A: 1, B: "foo"})}),
+      /Not a function: 'rec.A.lower'/);   // Because rec.A is not a string.
+
+    await assert.isRejected(setAndCompile("lower(rec.A) == rec.B"),
+      /Unknown variable 'lower'/);
+
+    compiled = await setAndCompile("rec.get('A') == rec.B");
+    assert.throws(() => compiled({user: new User({}), rec: V({A: "foo", B: "foo"})}),
+      /Not a function: 'rec.get'/);   // only explicitly supported functions are supported
+
+    // Try to be tricky: if rec.A is a function, that's weird, make sure we don't call it blindly.
+    compiled = await setAndCompile("rec.A() == rec.B");
+    assert.throws(() => compiled({user: new User({}), rec: V({A: (() => 1) as any, B: "foo"})}),
+      /Not a function: 'rec.A'/);     // only explicitly supported functions are supported
+  });
+
   it('should handle nested attribute lookups', async function () {
     const compiled = await setAndCompile('user.office.city == "New York"');
     assert.equal(compiled({user: new User({office: V({city: "New York"})})}), true);
@@ -178,6 +223,25 @@ describe('ACLFormula', function() {
     assert.throws(() => compiled({user: new User({})}), /No value for 'user.office'/);
     assert.equal(compiled({user: new User({office: 5})}), false);
     assert.throws(() => compiled({user: new User({office: null})}), /No value for 'user.office'/);
+  });
+
+  it('should not support unexpected attributes', async function () {
+    let compiled = await setAndCompile("user.email.length == rec.A");
+    assert.equal(compiled({user: new User({email: 'Foo'}), rec: V({A: 3})}), false);
+    assert.equal(compiled({user: new User({email: 'Foo'}), rec: V({A: null})}), false);
+    assert.equal(compiled({user: new User({email: 'Foo'}), rec: V({A: ""})}), false);
+    assert.equal(compiled({user: new User({email: 'Foo'}), rec: V({A: undefined as any})}), true);
+    assert.equal(compiled({user: new User({email: {}}), rec: V({A: undefined as any})}), true);
+    assert.equal(compiled({user: new User({email: []}), rec: V({A: undefined as any})}), true);
+    assert.equal(compiled({user: new User({email: 5}), rec: V({A: undefined as any})}), true);
+    assert.equal(compiled({user: new User({email: {length: 'x'}}), rec: V({A: 'x'})}), true);
+
+    compiled = await setAndCompile("user.email.asdf == rec.A");
+    assert.equal(compiled({user: new User({email: 'Foo'}), rec: V({A: undefined as any})}), true);
+
+    compiled = await setAndCompile("user.email.toUpperCase.name == rec.A");
+    assert.throws(() => compiled({user: new User({email: 'Foo'}), rec: V({A: ""})}),
+      /No value for 'user.email.toUpperCase'/);
   });
 
   it('should handle "in" and "not in" when RHS is nullish', async function() {
@@ -193,6 +257,33 @@ describe('ACLFormula', function() {
     compiled = await setAndCompile('(user.Email in rec.emails) == (user.Name in rec.emails)');
     assert.equal(compiled({user, rec: V({emails: null})}), true);
     assert.equal(compiled({user, rec: V({emails: 'X@'})}), false);
+
+    compiled = await setAndCompile('"A" in user.Office.Rooms');
+    assert.equal(compiled({user: new User({Office: V({Rooms: null})})}), false);
+    assert.equal(compiled({user: new User({Office: V({Rooms: [GristObjCode.List, 'A']})})}), true);
+    assert.equal(compiled({user: new User({Office: V({Rooms: [GristObjCode.List, 'B']})})}), false);
+  });
+
+  it('should handle "in" and "not in" when RHS is not a list', async function() {
+    let compiled = await setAndCompile('user.Email in rec.emails');
+    const user = new User({Email: 'X@'});
+    assert.equal(compiled({user, rec: V({emails: 'X@'})}), true);
+    assert.equal(compiled({user, rec: V({emails: 0})}), false);
+    assert.equal(compiled({user, rec: V({emails: 17.5})}), false);
+    assert.equal(compiled({user, rec: V({emails: undefined as any})}), false);
+
+    // The substring behavior checked here isn't what we want necessarily, because of risk of
+    // misuse, but it's been kept so far for backward compatibility.
+    assert.equal(compiled({user, rec: V({emails: 'AliceX@Y'})}), true);
+    // In case of a list, "in" checks for membership, not substrings.
+    assert.equal(compiled({user, rec: V({emails: [GristObjCode.List, 'X@']})}), true);
+    assert.equal(compiled({user, rec: V({emails: [GristObjCode.List, 'AliceX@Y']})}), false);
+
+    compiled = await setAndCompile('user.Email not in rec.emails');
+    assert.equal(compiled({user, rec: V({emails: 'X@'})}), false);
+    assert.equal(compiled({user, rec: V({emails: 0})}), true);
+    assert.equal(compiled({user, rec: V({emails: 17.5})}), true);
+    assert.equal(compiled({user, rec: V({emails: undefined as any})}), true);
   });
 
   it('should decode cell values so that "in" is safe to use with lists', async function () {
@@ -208,8 +299,9 @@ describe('ACLFormula', function() {
 
     // This should never happen (nothing should be encoded as an empty list),
     // this just shows what would happen.
-    assert.throws(() => compiled({user, rec: V({emails: [] as any})}),
-      /\.includes is not a function/);
+    assert.equal(compiled({user, rec: V({emails: [] as any})}), false);
+    // This is also false because once decoded, the value isn't a list, but an UnknownValue.
+    assert.equal(compiled({user, rec: V({emails: ['A', 'L'] as any})}), false);
 
     // List literals aren't decoded and work as expected.
     compiled = await setAndCompile('user.Email in []');

@@ -5,7 +5,7 @@ import {cssMemberImage, cssMemberListItem, cssMemberPrimary,
         cssMemberSecondary, cssMemberText} from 'app/client/ui/UserItem';
 import {testId, theme, vars} from 'app/client/ui2018/cssVars';
 import {PermissionDataWithExtraUsers} from 'app/common/ActiveDocAPI';
-import {menu, menuCssClass, menuItemLink} from 'app/client/ui2018/menus';
+import {gristFloatingMenuClass, menu, menuCssClass, menuItemLink} from 'app/client/ui2018/menus';
 import {IGristUrlState, userOverrideParams} from 'app/common/gristUrls';
 import {FullUser} from 'app/common/LoginSessionAPI';
 import {ANONYMOUS_USER_EMAIL, EVERYONE_EMAIL} from 'app/common/UserAPI';
@@ -18,6 +18,7 @@ import {waitGrainObs} from 'app/common/gutil';
 import noop from 'lodash/noop';
 
 const t = makeT("ViewAsDropdown");
+const userT = makeT('UserManagerModel');
 
 function isSpecialEmail(email: string) {
   return email === ANONYMOUS_USER_EMAIL || email === EVERYONE_EMAIL;
@@ -76,6 +77,7 @@ export class ACLUsersPopup extends Disposable {
         (user: UserAccessData) => this._buildUserRow(user, {isExampleUser: true, ...options});
       return cssMenuWrap(cssMenu(
         dom.cls(menuCssClass),
+        dom.cls(gristFloatingMenuClass),
         cssUsers.cls(''),
         cssHeader(t('View As'), dom.show(this._shareUsers.length > 0)),
         dom.forEach(this._shareUsers, buildRow),
@@ -127,7 +129,7 @@ export class ACLUsersPopup extends Disposable {
       ),
       cssMemberText(
         cssMemberPrimary(user.name || dom('span', user.email),
-          cssRole('(', getUserRoleText(user), ')', testId('acl-user-access')),
+          cssRole('(', userT(getUserRoleText(user)), ')', testId('acl-user-access')),
         ),
         user.name ? cssMemberSecondary(user.email) : null
       ),

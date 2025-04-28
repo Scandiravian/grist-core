@@ -83,8 +83,8 @@ export function compilePredicateFormula(
       case 'GtE':   return compileAndCombine(args, ([a, b]) => a >= b);
       case 'Is':    return compileAndCombine(args, ([a, b]) => a === b);
       case 'IsNot': return compileAndCombine(args, ([a, b]) => a !== b);
-      case 'In':    return compileAndCombine(args, ([a, b]) => Boolean(b?.includes(a)));
-      case 'NotIn': return compileAndCombine(args, ([a, b]) => !b?.includes(a));
+      case 'In':    return compileAndCombine(args, ([a, b]) => includes(b, a));
+      case 'NotIn': return compileAndCombine(args, ([a, b]) => !includes(b, a));
       case 'List':  return compileAndCombine(args, (values) => values);
       case 'Const': return constant(node[1] as CellValue);
       case 'Name': {
@@ -110,6 +110,25 @@ export function compilePredicateFormula(
         const attrName = rawArgs[1] as string;
         return compileAndCombine([args[0]], ([value]) => getAttr(value, attrName, args[0]));
       }
+      case 'Call': {
+        return compileAndCombine(args, (values) => {
+          const func = values[0];
+          if (!(func instanceof SupportedCallable)) {
+            throw new Error(`Not a function: '${describeNode(args[0])}'`);
+          }
+          return func.func(...values.slice(1));
+        });
+      }
+      case 'keywords': {
+        // E.g. foo(a, b=2, c=3) becomes [Call, foo, a, [keywords, [b, 2], [c, 3]]],
+        // which becomes foo(a, {b: 2, c: 3}).
+        const pairs = rawArgs.filter((pair): pair is [string, ParsedPredicateFormula] =>
+          Array.isArray(pair) && pair.length == 2 && typeof pair[0] === 'string');
+        const keys = pairs.map(p => p[0]);
+        const values = pairs.map(p => p[1]);
+        return compileAndCombine(values, (compiledValues) =>
+          Object.fromEntries(keys.map((k, i) => [k, compiledValues[i]])));
+      }
       case 'Comment': return compileNode(args[0]);
     }
     throw new Error(`Unknown node type '${node[0]}'`);
@@ -131,6 +150,34 @@ export function compilePredicateFormula(
   return (input) => Boolean(compiledPredicateFormula(input));
 }
 
+// Wrapper for callables that we explicitly support. We should be careful not to expose anything
+// that could be used unsafely.
+class SupportedCallable {
+  constructor(public readonly func: Function) {}
+}
+
+function getStringMethod(value: string, attrName: string): SupportedCallable|undefined {
+  switch (attrName) {
+    case 'lower': return new SupportedCallable(() => value.toLowerCase());
+    case 'upper': return new SupportedCallable(() => value.toUpperCase());
+  }
+  return undefined;
+}
+
+function includes(haystack: unknown, needle: unknown) {
+  if (Array.isArray(haystack)) {
+    return haystack.includes(needle);
+  }
+  // We may not want to support "in" for strings because of danger of using e.g. `user.Email in
+  // "alice@example.com"` (instead of `["alice@example.com"]`) and not realizing that it also
+  // matches, say, "ice@example.co". This happens. But disabling it may interfere with existing
+  // documents, so for now we are keeping this behavior for backward compatibility.
+  if (typeof haystack === 'string' && typeof needle === 'string') {
+    return haystack.includes(needle);
+  }
+  return false;
+}
+
 function describeNode(node: ParsedPredicateFormula): string {
   if (node[0] === 'Name') {
     return node[1] as string;
@@ -149,15 +196,26 @@ function getAttr(value: any, attrName: string, valueNode: ParsedPredicateFormula
     }
     throw new Error(`No value for '${describeNode(valueNode)}'`);
   }
-  return typeof value.get === 'function'
-    ? decodeObject(value.get(attrName)) // InfoView
-    : value[attrName];
+  if (typeof value.get === 'function') {
+    return decodeObject(value.get(attrName));  // InfoView
+  } else if (typeof value === 'string') {
+    return getStringMethod(value, attrName);
+  } else if (value !== null && typeof value === 'object' &&
+      !Array.isArray(value) &&            // We don't support attribute lookups on arrays.
+      value.hasOwnProperty(attrName)) {
+    // Check value and attrName more carefully to reduce the risk of shenanigans.
+    return value[attrName];
+  }
+  return undefined;
 }
 
 /**
  * Predicate formula properties.
  */
 export interface PredicateFormulaProperties {
+  // Normally includes the full parsed formula.
+  formulaParsed?: ParsedPredicateFormula;
+
   /**
    * List of column ids that are referenced by either `$` or `rec.` notation.
    */
@@ -183,8 +241,9 @@ export function getPredicateFormulaProperties(
   formula: ParsedPredicateFormula
 ): PredicateFormulaProperties {
   return {
-    recColIds: [...getRecColIds(formula)],
-    choiceColIds: [...getChoiceColIds(formula)],
+    formulaParsed: formula,
+    recColIds: getRecColIds(formula),
+    choiceColIds: getChoiceColIds(formula),
   };
 }
 
@@ -216,4 +275,37 @@ function collectColIds(
     return [colId];
   }
   return formula.flatMap(el => Array.isArray(el) ? collectColIds(el, isIdentifierWithColIds) : []);
+}
+
+// It would be great if our compilation of our little subset of Python also supported static
+// type-checking. Rather than build that, we'll check the formula by seeing if we get an
+// exception on a sample input that has all default value. E.g. this will catch if we use
+// foo.upper() on a non-string, or other non-existent methods.
+// Returns error message if any, or false if no error. The strange return type is to match a
+// convention for collecting warnings in the AccessRules class.
+export function typeCheckFormula(
+  formulaParsed: ParsedPredicateFormula,
+  sampleRecord: InfoView,
+  userAttrSamples: {[key: string]: InfoView},
+): string|false {
+  try {
+    const compiledFormula = compilePredicateFormula(formulaParsed);
+    const sampleUser: UserInfo = {
+      ...userAttrSamples,
+      Name: "",
+      Email: "",
+      Access: "owners",
+      Origin: "",
+      LinkKey: {key: ""},
+      UserID: 0,
+      UserRef: "",
+      SessionID: "",
+      ShareRef: 0,
+    };
+    const sampleInput: PredicateFormulaInput = {user: sampleUser, rec: sampleRecord, newRec: sampleRecord};
+    compiledFormula(sampleInput);
+  } catch (e) {
+    return e.message;
+  }
+  return false;
 }

@@ -1,5 +1,5 @@
 import { ICustomWidget } from 'app/common/CustomWidget';
-import { GristDeploymentType, GristLoadConfig } from 'app/common/gristUrls';
+import { GristDeploymentType, GristLoadConfig, LatestVersionAvailable } from 'app/common/gristUrls';
 import { LocalPlugin } from 'app/common/plugin';
 import { SandboxInfo } from 'app/common/SandboxInfo';
 import { UserProfile } from 'app/common/UserAPI';
@@ -7,12 +7,13 @@ import { Document } from 'app/gen-server/entity/Document';
 import { Organization } from 'app/gen-server/entity/Organization';
 import { User } from 'app/gen-server/entity/User';
 import { Workspace } from 'app/gen-server/entity/Workspace';
-import { Activations } from 'app/gen-server/lib/Activations';
-import { HomeDBManager } from 'app/gen-server/lib/homedb/HomeDBManager';
+import { ActivationsManager } from 'app/gen-server/lib/ActivationsManager';
+import { HomeDBManager, UserChange } from 'app/gen-server/lib/homedb/HomeDBManager';
 import { IAccessTokens } from 'app/server/lib/AccessTokens';
 import { RequestWithLogin } from 'app/server/lib/Authorizer';
 import { Comm } from 'app/server/lib/Comm';
 import { create } from 'app/server/lib/create';
+import { DocManager } from 'app/server/lib/DocManager';
 import { Hosts } from 'app/server/lib/extractOrg';
 import { GristJobs } from 'app/server/lib/GristJobs';
 import { createNullAuditLogger, IAuditLogger } from 'app/server/lib/IAuditLogger';
@@ -26,9 +27,9 @@ import { ISendAppPageOptions } from 'app/server/lib/sendAppPage';
 import { fromCallback } from 'app/server/lib/serverUtils';
 import { Sessions } from 'app/server/lib/Sessions';
 import { ITelemetry } from 'app/server/lib/Telemetry';
+import { IGristCoreConfig, loadGristCoreConfig } from "app/server/lib/configCore";
 import * as express from 'express';
 import { IncomingMessage } from 'http';
-import { IGristCoreConfig, loadGristCoreConfig } from "./configCore";
 
 /**
  * Basic information about a Grist server.  Accessible in many
@@ -36,6 +37,7 @@ import { IGristCoreConfig, loadGristCoreConfig } from "./configCore";
  */
 export interface GristServer {
   readonly create: ICreate;
+  readonly testPending: boolean;
   settings?: IGristCoreConfig;
   getHost(): string;
   getHomeUrl(req: express.Request, relPath?: string): string;
@@ -53,7 +55,7 @@ export interface GristServer {
   getComm(): Comm;
   getDeploymentType(): GristDeploymentType;
   getHosts(): Hosts;
-  getActivations(): Activations;
+  getActivations(): ActivationsManager;
   getInstallAdmin(): InstallAdmin;
   getHomeDBManager(): HomeDBManager;
   getStorageManager(): IDocStorageManager;
@@ -75,7 +77,14 @@ export interface GristServer {
   getInfo(key: string): any;
   getJobs(): GristJobs;
   getBilling(): IBilling;
+  getLatestVersionAvailable(): LatestVersionAvailable|undefined;
+  setLatestVersionAvailable(latestVersionAvailable: LatestVersionAvailable): void
+  publishLatestVersionAvailable(latestVersionAvailable: LatestVersionAvailable): Promise<void>;
   setRestrictedMode(restrictedMode?: boolean): void;
+  getDocManager(): DocManager;
+  isRestrictedMode(): boolean;
+  onUserChange(callback: (change: UserChange) => Promise<void>): void;
+  onStreamingDestinationsChange(callback: (orgId?: number) => Promise<void>): void;
 }
 
 export interface GristLoginSystem {
@@ -134,6 +143,7 @@ export interface DocTemplate {
 export function createDummyGristServer(): GristServer {
   return {
     create,
+    testPending: false,
     settings: loadGristCoreConfig(),
     getHost() { return 'localhost:4242'; },
     getHomeUrl() { return 'http://localhost:4242'; },
@@ -143,7 +153,7 @@ export function createDummyGristServer(): GristServer {
     getOwnUrl() { return 'http://localhost:4242'; },
     getPermitStore() { throw new Error('no permit store'); },
     getExternalPermitStore() { throw new Error('no external permit store'); },
-    getGristConfig() { return { homeUrl: '', timestampMs: 0 }; },
+    getGristConfig() { return { homeUrl: '', timestampMs: 0, serveSameOrigin: true }; },
     getOrgUrl() { return Promise.resolve(''); },
     getResourceUrl() { return Promise.resolve(''); },
     getSessions() { throw new Error('no sessions'); },
@@ -172,7 +182,14 @@ export function createDummyGristServer(): GristServer {
     getInfo(key: string) { return undefined; },
     getJobs(): GristJobs { throw new Error('no job system'); },
     getBilling() { throw new Error('no billing'); },
+    getLatestVersionAvailable() { throw new Error('no version checking'); },
+    setLatestVersionAvailable() { /* do nothing */ },
+    publishLatestVersionAvailable() { return Promise.resolve(); },
     setRestrictedMode() { /* do nothing */ },
+    getDocManager() { throw new Error('no DocManager'); },
+    isRestrictedMode() { return false; },
+    onUserChange() { /* do nothing */ },
+    onStreamingDestinationsChange() { /* do nothing */ },
   };
 }
 

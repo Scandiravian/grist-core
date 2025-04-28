@@ -40,8 +40,7 @@ if (require.main === module) {
 export function getProgram(): commander.Command {
   const program = commander.program;
   program
-    .name('grist-toolbox')    // haven't really settled on a name yet.
-                              // want to reserve "grist" for electron app?
+    .name('grist-cli')
     .description('a toolbox of handy Grist-related utilities');
 
   addAuditLogsCommand(program, {nested: true});
@@ -250,6 +249,7 @@ export function addDbCommand(program: commander.Command,
 // Add command related to sqlite:
 //   sqlite gristify <sqlite-file>
 //   sqlite clean <sqlite-file>
+//   sqlite query <sqlite-file> <query-string>
 export function addSqliteCommand(program: commander.Command) {
   const sub = program.command('sqlite')
     .description('commands for accessing sqlite files');
@@ -262,6 +262,11 @@ export function addSqliteCommand(program: commander.Command) {
   sub.command('clean <sqlite-file>')
     .description('remove grist metadata from an sqlite file')
     .action(filename => new Gristifier(filename).degristify());
+
+  sub.command('query <sqlite-file> <query-string>')
+    .description('read data from a sqlite file that may contain Grist marshaling')
+    .option('--json', 'output as JSON')
+    .action((filename, query, options) => new Gristifier(filename).query(query, options));
 }
 
 export function addVersionCommand(program: commander.Command) {

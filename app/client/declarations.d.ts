@@ -2,7 +2,6 @@ declare module "app/client/components/AceEditor";
 declare module "app/client/components/Clipboard";
 declare module "app/client/components/CodeEditorPanel";
 declare module "app/client/components/DetailView";
-declare module "app/client/components/DocConfigTab";
 declare module "app/client/components/GridView";
 declare module "app/client/lib/Mousetrap";
 declare module "app/client/lib/browserGlobals";
@@ -338,4 +337,36 @@ interface Location {
 
 interface JQuery {
   datepicker(options: unknown): JQuery;
+  resizable(options?: ResizableOptions): JQuery;
+}
+
+interface ResizableOptions {
+  disabled?: boolean;
+  handles?: "n" | "e" | "s" | "w" | "ne" | "se" | "sw" | "nw" | "all";
+  minHeight?: number;
+  minWidth?: number;
+  maxHeight?: number;
+  maxWidth?: number;
+  resize?: (event: Event, ui: JQueryUI) => void,
+  stop?: (event: Event, ui: JQueryUI) => void,
+}
+
+interface JQueryUI {
+  element: JQuery;
+  helper: JQuery;
+  originalElement: JQuery;
+  originalPosition: Position;
+  originalSize: Size;
+  position: Position;
+  size: Size;
+}
+
+interface Position {
+  left: number;
+  top: number;
+}
+
+interface Size {
+  width: number;
+  height: number;
 }

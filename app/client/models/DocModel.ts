@@ -42,10 +42,12 @@ import {createViewFieldRec, ViewFieldRec} from 'app/client/models/entities/ViewF
 import {createViewRec, ViewRec} from 'app/client/models/entities/ViewRec';
 import {createViewSectionRec, ViewSectionRec} from 'app/client/models/entities/ViewSectionRec';
 import {CellRec, createCellRec} from 'app/client/models/entities/CellRec';
-import {RefListValue} from 'app/common/gristTypes';
+import {isRefListType, RecalcWhen, RefListValue} from 'app/common/gristTypes';
 import {decodeObject} from 'app/plugin/objtypes';
-import {toKo} from 'grainjs';
+import {Disposable, toKo} from 'grainjs';
 import {UIRowId} from 'app/plugin/GristAPI';
+import {isNonNullish} from 'app/common/gutil';
+
 
 // Re-export all the entity types available. The recommended usage is like this:
 //    import {ColumnRec, ViewFieldRec} from 'app/client/models/DocModel';
@@ -117,7 +119,7 @@ export function refListRecords<TRow extends MetaRowModel>(
 // Use an alias for brevity.
 type MTM<RowModel extends MetaRowModel> = MetaTableModel<RowModel>;
 
-export class DocModel {
+export class DocModel extends Disposable {
   // MTM is a shorthand for MetaTableModel below, to keep each item to one line.
   public docInfo: MTM<DocInfoRec> = this._metaTableModel("_grist_DocInfo", createDocInfoRec);
   public tables: MTM<TableRec> = this._metaTableModel("_grist_Tables", createTableRec);
@@ -149,7 +151,7 @@ export class DocModel {
   // Another map, this one mapping tableRef (rowId) to DataTableModel.
   public dataTablesByRef = new Map<number, DataTableModel>();
 
-  public allTabs: KoArray<TabBarRec> = this.tabBar.createAllRowsModel('tabPos');
+  public allTabs: KoArray<TabBarRec> = this.autoDispose(this.tabBar.createAllRowsModel('tabPos'));
 
   public allPages: ko.Computed<PageRec[]>;
   /** Pages that are shown in the menu. These can include censored pages if they have children. */
@@ -173,13 +175,14 @@ export class DocModel {
   public showDocTutorialTable: boolean =
     // We skip subscribing to the observables below since they normally shouldn't change during
     // this object's lifetime. If that changes, this should be made into a computed observable.
-    !this._docPageModel.isTutorialFork.get() ||
+    !this._docPageModel?.isTutorialFork.get() ||
     canEdit(this._docPageModel.currentDoc.get()?.trunkAccess ?? null);
 
   // List of all the metadata tables.
   private _metaTables: Array<MetaTableModel<any>>;
 
-  constructor(public readonly docData: DocData, private readonly _docPageModel: DocPageModel) {
+  constructor(public readonly docData: DocData, private readonly _docPageModel?: DocPageModel) {
+    super();
     // For all the metadata tables, load their data (and create the RowModels).
     for (const model of this._metaTables) {
       model.loadData();
@@ -188,40 +191,40 @@ export class DocModel {
     this.docInfoRow = this.docInfo.getRowModel(1);
 
     // An observable array of all tables, sorted by tableId, with no exclusions.
-    this.allTables = this._createAllTablesArray();
+    this.allTables = this.autoDispose(this._createAllTablesArray());
 
     // An observable array of user-visible tables, sorted by tableId, excluding summary tables.
     // This is a publicly exposed member.
-    this.visibleTables = this._createVisibleTablesArray();
+    this.visibleTables = this.autoDispose(this._createVisibleTablesArray());
 
     // Observable arrays of raw data and summary tables, sorted by tableId.
-    this.rawDataTables = this._createRawDataTablesArray();
-    this.rawSummaryTables = this._createRawSummaryTablesArray();
+    this.rawDataTables = this.autoDispose(this._createRawDataTablesArray());
+    this.rawSummaryTables = this.autoDispose(this._createRawSummaryTablesArray());
 
     // An observable array of all tableIds. A shortcut mapped from allTables.
-    const allTableIds = ko.computed(() => this.allTables.all().map(t => t.tableId()));
+    const allTableIds = this.autoDispose(ko.computed(() => this.allTables.all().map(t => t.tableId())));
     this.allTableIds = koArray.syncedKoArray(allTableIds);
 
     // An observable array of user-visible tableIds. A shortcut mapped from visibleTables.
-    const visibleTableIds = ko.computed(() => this.visibleTables.all().map(t => t.tableId()));
+    const visibleTableIds = this.autoDispose(ko.computed(() => this.visibleTables.all().map(t => t.tableId())));
     this.visibleTableIds = koArray.syncedKoArray(visibleTableIds);
 
     // Create an observable array of RowModels for all the data tables. We'll trigger
     // onAddTable/onRemoveTable in response to this array's splice events below.
-    const allTableMetaRows = this.tables.createAllRowsModel('id');
+    const allTableMetaRows = this.autoDispose(this.tables.createAllRowsModel('id'));
 
     // For a new table, we get AddTable action followed by metadata actions to add a table record
     // (which triggers this subscribeForEach) and to add all the column records. So we have to keep
     // in mind that metadata for columns isn't available yet.
-    allTableMetaRows.subscribeForEach({
+    this.autoDispose(allTableMetaRows.subscribeForEach({
       add: r => this._onAddTable(r),
       remove: r => this._onRemoveTable(r),
-    });
+    }));
 
     // Get a list of only the visible pages.
-    const allPages = this.pages.createAllRowsModel('pagePos');
-    this.allPages = ko.computed(() => allPages.all());
-    this.menuPages = ko.computed(() => {
+    const allPages = this.autoDispose(this.pages.createAllRowsModel('pagePos'));
+    this.allPages = this.autoDispose(ko.computed(() => allPages.all()));
+    this.menuPages = this.autoDispose(ko.computed(() => {
       const pagesToShow = this.allPages().filter(p => !p.isSpecial()).sort((a, b) => a.pagePos() - b.pagePos());
       const parent = memoize((page: PageRec) => {
         const myIdentation = page.indentation();
@@ -238,18 +241,111 @@ export class DocModel {
       // Helper to test if the page is hidden or is in a hidden branch.
       const hidden = memoize((page: PageRec): boolean => page.isHidden() || ancestors(page).some(p => p.isHidden()));
       return pagesToShow.filter(p => !hidden(p));
-    });
-    this.visibleDocPages = ko.computed(() => this.allPages().filter(p => !p.isHidden()));
+    }));
+    this.visibleDocPages = this.autoDispose(ko.computed(() => this.allPages().filter(p => !p.isHidden())));
 
-    this.hasDocTour = ko.computed(() => this.visibleTableIds.all().includes('GristDocTour'));
+    this.hasDocTour = this.autoDispose(ko.computed(() => this.visibleTableIds.all().includes('GristDocTour')));
 
-    this.isTutorial = ko.computed(() =>
-      toKo(ko, this._docPageModel.isTutorialFork)()
-      && this.allTableIds.all().includes('GristDocTutorial'));
+    this.isTutorial = this.autoDispose(ko.computed(() =>
+      isNonNullish(this._docPageModel)
+      && toKo(ko, this._docPageModel.isTutorialFork)()
+      && this.allTableIds.all().includes('GristDocTutorial')));
   }
 
   public getTableModel(tableId: string) {
     return this.dataTables[tableId];
+  }
+
+  /**
+   * If the given section is the target of linking, collect and return the active rowIDs up the
+   * chain of links, returning the list of rowIds starting with the current section's parent. This
+   * method is intended for when there is ambiguity such as when RefList linking is involved.
+   * In other cases, returns undefined.
+   */
+  public getLinkingRowIds(sectionId: number): UIRowId[]|undefined {
+    const linkingRowIds: UIRowId[] = [];
+    let anyAmbiguity = false;
+    let section = this.viewSections.getRowModel(sectionId);
+    const seen = new Set<number>();
+    while (section?.id.peek() && !seen.has(section.id.peek())) {
+      seen.add(section.id.peek());
+      const rowId = section.activeRowId.peek() || 'new';
+      if (isRefListType(section.linkTargetCol.peek().type.peek()) || rowId === 'new') {
+        anyAmbiguity = true;
+      }
+      linkingRowIds.push(rowId);
+      section = section.linkSrcSection.peek();
+    }
+    return anyAmbiguity ? linkingRowIds.slice(1) : undefined;
+  }
+
+
+
+  // Turn the given columns into empty columns, losing any data stored in them.
+  public async clearColumns(colRefs: number[], {keepType}: { keepType?: boolean } = {}): Promise<void> {
+    await this.columns.sendTableAction(
+      ['BulkUpdateRecord', colRefs, {
+        isFormula: colRefs.map(f => true),
+        formula: colRefs.map(f => ''),
+        ...(keepType ? {} : {
+          type: colRefs.map(f => 'Any'),
+          widgetOptions: colRefs.map(f => ''),
+          visibleCol: colRefs.map(f => null),
+          displayCol: colRefs.map(f => null),
+          rules: colRefs.map(f => null),
+        }),
+        // Set recalc settings to defaults when emptying a column.
+        recalcWhen: colRefs.map(f => RecalcWhen.DEFAULT),
+        recalcDeps: colRefs.map(f => null),
+      }]
+    );
+  }
+
+  // Convert the given columns to data, saving the calculated values and unsetting the formulas.
+  public async convertIsFormula(colRefs: number[], opts: { toFormula: boolean, noRecalc?: boolean }): Promise<void> {
+    return this.columns.sendTableAction(
+      ['BulkUpdateRecord', colRefs, {
+        isFormula: colRefs.map(f => opts.toFormula),
+        recalcWhen: colRefs.map(f => opts.noRecalc ? RecalcWhen.NEVER : RecalcWhen.DEFAULT),
+        recalcDeps: colRefs.map(f => null),
+      }]
+    );
+  }
+
+  // Updates formula for a column.
+  public async updateFormula(colRef: number, formula: string): Promise<void> {
+    return this.columns.sendTableAction(
+      ['UpdateRecord', colRef, {
+        formula,
+      }]
+    );
+  }
+
+  // Convert column to pure formula column.
+  public async convertToFormula(colRef: number, formula: string): Promise<void> {
+    return this.columns.sendTableAction(
+      ['UpdateRecord', colRef, {
+        isFormula: true,
+        formula,
+        recalcWhen: RecalcWhen.DEFAULT,
+        recalcDeps: null,
+      }]
+    );
+  }
+
+  // Convert column to data column with a trigger formula
+  public async convertToTrigger(
+    colRefs: number,
+    formula: string,
+    recalcWhen: RecalcWhen = RecalcWhen.DEFAULT ): Promise<void> {
+    return this.columns.sendTableAction(
+      ['UpdateRecord', colRefs, {
+        isFormula: false,
+        formula,
+        recalcWhen: recalcWhen,
+        recalcDeps: null,
+      }]
+    );
   }
 
   private _metaTableModel<TName extends keyof SchemaTypes, TRow extends IRowModel<TName>>(
@@ -261,7 +357,7 @@ export class DocModel {
     // To keep _metaTables private member listed after public ones, initialize it on first use.
     if (!this._metaTables) { this._metaTables = []; }
     this._metaTables.push(model);
-    return model;
+    return this.autoDispose(model);
   }
 
   private _onAddTable(tableMetaRow: TableRec) {
