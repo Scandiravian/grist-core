@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 # Separate arguments before and after a -- divider.
 from itertools import groupby
 
@@ -86,7 +87,7 @@ settings = {
         # during imports, try commenting this section out. We could make imports work
         # for any version of gvisor by setting mode when using tmp.dir to allow
         # others to list directory contents.
-        "user": {"uid": os.getuid(), "gid": 0},
+        "user": {"uid": os.getuid(), "gid": os.getgid()},
         "args": cmd_args,
         "env": env,
         "cwd": "/",
@@ -178,7 +179,7 @@ if not include_python2:
     ]
 
     if not candidates:
-        raise Exception("could not find python3 in weird paths")
+        raise Exception("could not find python3")
     best = os.path.realpath(candidates[0])
     preserve(best)
 
@@ -192,8 +193,8 @@ if not include_python3:
     preserve("/usr/lib")
 
 # Set up any specific shares requested.
-# if args.mount:
-#     preserve(*args.mount)
+if args.mount:
+    preserve(*args.mount)
 
 for directory in os.listdir("/"):
     if directory not in exceptions and ("/" + directory) not in preserved:
@@ -206,9 +207,6 @@ for directory in os.listdir("/"):
                 "type": "tmpfs",
             },
         )
-
-sys.stderr.write("mounts: " + json.dumps(mounts, indent=4) + "\n")
-sys.stderr.flush()
 
 # Set up faketime inside the sandbox if requested.  Can't be set up outside the sandbox,
 # because gvisor is written in Go and doesn't use the standard library that faketime
@@ -236,9 +234,6 @@ cmd_args += more_args
 # Helper for assembling a runsc command.
 # Takes the directory to work in and a list of arguments to append.
 def make_command(root_dir, action):
-    sys.stderr.write("make_command: " + root_dir + " " + " ".join(action) + "\n")
-    sys.stderr.flush()
-
     flag_string = os.environ.get("GVISOR_FLAGS") or "-rootless"
     flags = flag_string.split(" ")
     command = (
@@ -268,165 +263,108 @@ with tempfile.TemporaryDirectory() as root:  # pylint: disable=no-member
     else:
         if not args.checkpoint:
             if args.restore:
-
                 sys.stderr.write("args not dry-run, not checkpoint, is restore\n")
                 sys.stderr.flush()
+
                 command = make_command(
                     root, ["restore", "--image-path=" + args.restore]
                 )
             else:
                 sys.stderr.write("args not dry-run, not checkpoint, not restore\n")
-
                 sys.stderr.flush()
-                command = make_command(root, ["run"])
 
+                command = make_command(root, ["run"])
 
             sys.stderr.write("runsc command: " + " ".join(command) + "\n")
             sys.stderr.flush()
-            result = subprocess.run(
-                command, cwd=root, capture_output=True, check=True
-            )  # pylint: disable=no-member
 
-            p_stdout = result.stdout
-            if p_stdout is not None:
-                stdout_text = p_stdout.decode("utf-8")
-
-                sys.stderr.write("Started gvisor runsc: " + "\n".join(stdout_text) + "\n")
+            # result = subprocess.run(
+            #     command, cwd=root, check=True
+            # )  # pylint: disable=no-member
+            with subprocess.Popen(command, cwd=root) as proc:
+                sys.stderr.write("process started" + "\n")
                 sys.stderr.flush()
 
-            if result.stderr is None:
-                raise Exception("stderr is None")
+                ret_code = proc.wait()
 
-
-            if result.returncode != 0:
-                stdout = result.stdout.decode("utf-8")
-                stderr = result.stderr.decode("utf-8")
                 sys.stderr.write(
-                    "gvisor runsc problem (is checkpoint): "
-                    + json.dumps(command)
-                    + "\nstdout: "
-                    + stdout
-                    + "\nstderr: "
-                    + stderr
-                    + "\nconfig:"
-                    + json.dumps(settings, indent=2)
+                    "process finished with return code:" + str(ret_code) + "\n"
                 )
                 sys.stderr.flush()
 
-                raise Exception(
-                    "gvisor runsc problem (is checkpoint): "
-                    + json.dumps(command)
-                    + "\nstdout: "
-                    + stdout
-                    + "\nstderr: "
-                    + stderr
-                    + "\nconfig:"
-                    + json.dumps(settings, indent=2)
-                )
+                if (
+                    ret_code != 0
+                ):  # NOTE: this isn't needed, when `check=True` in the command call
+                    raise Exception("gvisor runsc problem: " + json.dumps(command))
+
+            # if (
+            #     result.returncode != 0
+            # ):  # NOTE: this isn't needed, when `check=True` in the command call
+            #     raise Exception("gvisor runsc problem: " + json.dumps(command))
         else:
-            if not args.checkpoint:
-                if args.restore:
-                    sys.stderr.write("args not dry-run, not checkpoint(x2), is restore\n")
-                    sys.stderr.flush()
-                    command = make_command(
-                        root, ["restore", "--image-path=" + args.restore]
-                    )
-                else:
-                    sys.stderr.write("args not dry-run, not checkpoint(x2), not restore\n")
-                    sys.stderr.flush()
-                    command = make_command(root, ["run"])
-                    result = subprocess.run(command, cwd=root)  # pylint: disable=no-member
-                    if result.returncode != 0:
-                        stdout = ""
-                        stderr = ""
-                        if result.stdout is not None:
-                            stdout = result.stdout.decode("utf-8")
-                        if result.stderr is not None:
-                            stderr = result.stderr.decode("utf-8")
+            # We've been asked to make a checkpoint.
+            # Start up the sandbox, and wait for it to emit a message on stderr ('Ready').
+            sys.stderr.write("args not dry-run, is checkpoint, creating checkpoint\n")
+            sys.stderr.flush()
 
-                        sys.stderr.write(
-                            "gvisor runsc problem (not checkpoint): "
-                            + json.dumps(command)
-                            + "\nstdout: "
-                            + stdout
-                            + "\nstderr: "
-                            + stderr
-                            + "\nconfig:"
-                            + json.dumps(settings, indent=2)
-                        )
-                        sys.stderr.flush()
-                        raise Exception(
-                            "gvisor runsc problem (not checkpoint): "
-                            + json.dumps(command)
-                            + "\nstdout: "
-                            + stdout
-                            + "\nstderr: "
-                            + stderr
-                            + "\nconfig:"
-                            + json.dumps(settings, indent=2)
-                        )
+            command = make_command(root, ["run"])
+            process = subprocess.Popen(
+                command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
 
-            else:
-                # We've been asked to make a checkpoint.
-                # Start up the sandbox, and wait for it to emit a message on stderr ('Ready').
-                sys.stderr.write("args not dry-run, not checkpoint(x2), not restore: checkpoint created succesfully\n")
-                sys.stderr.flush()
-                command = make_command(root, ["run"])
-                process = subprocess.Popen(command, cwd=root, stderr=subprocess.PIPE)
+            p_stdout = process.stdout
+            if p_stdout is not None:
+                stdout_text = [line.decode("utf-8") for line in p_stdout.readlines()]
 
-                p_run_stdout = process.stdout
-                if p_run_stdout is not None:
-                    stdout_run_text = [line.decode("utf-8") for line in p_run_stdout.readlines()]
-
-                    sys.stderr.write("Started gvisor runsc: " + "\n".join(stdout_run_text) + "\n")
-                    sys.stderr.flush()
-
-                sys.stderr.write("Waiting for ready message\n")
-                sys.stderr.flush()
-                if process.stderr is None:
-                    raise Exception("stderr is None")
-
-                text = process.stderr.readline().decode("utf-8")  # wait for ready
-                sys.stderr.write("Got text: " + text + "\n")
-                sys.stderr.flush()
-                if "Ready" in text:
-                    sys.stderr.write("Ready message: " + text)
-                    sys.stderr.flush()
-                else:
-                    # Something unexpected has happened, echo the full error and hang.
-                    while True:
-                        sys.stderr.write("Problem: " + text)
-                        sys.stderr.flush()
-                        if process.stderr is None:
-                            continue
-                        text = process.stderr.readline().decode("utf-8")
-
-                # Remove existing checkpoint if present.
-                if os.path.exists(os.path.join(args.checkpoint, "checkpoint.img")):
-                    os.remove(os.path.join(args.checkpoint, "checkpoint.img"))
-                if os.path.exists(os.path.join(args.checkpoint, "checkpoint.json")):
-                    os.remove(os.path.join(args.checkpoint, "checkpoint.json"))
-                # Make the directory, so we will later have the right to delete the checkpoint if
-                # we wish to replace it. Otherwise there is a muddle around permissions.
-                if not os.path.exists(args.checkpoint):
-                    os.makedirs(args.checkpoint)
-                # Go ahead and run the runsc checkpoint command.
-                # This is destructive, it will kill the sandbox we are checkpointing.
-                command = make_command(
-                    root, ["checkpoint", "--image-path=" + args.checkpoint]
+                sys.stderr.write(
+                    "Started gvisor runsc: " + "\n".join(stdout_text) + "\n"
                 )
-                result = subprocess.run(command, cwd=root)  # pylint: disable=no-member
-                if result.returncode != 0:
-                    raise Exception(
-                        "gvisor runsc checkpointing problem: " + json.dumps(command)
-                    )
-                # Save the configuration of the checkpoint for easy reference.
-                with open(config_filename, "r", encoding="utf-8") as fin:
-                    with open(
-                        os.path.join(args.checkpoint, "checkpoint.json"),
-                        "w",
-                        encoding="utf-8",
-                    ) as fout:
-                        spec = json.load(fin)
-                        json.dump(spec, fout, indent=2)
- 
+                sys.stderr.flush()
+
+            sys.stderr.write("Waiting for ready message\n")
+            sys.stderr.flush()
+
+            text = process.stderr.readline().decode("utf-8")  # wait for ready
+
+            sys.stderr.write("Got text: " + text + "\n")
+            sys.stderr.flush()
+
+            if "Ready" in text:
+                sys.stderr.write("Ready message: " + text)
+                sys.stderr.flush()
+            else:
+                # Something unexpected has happened, echo the full error and hang.
+                while True:
+                    sys.stderr.write("Problem: " + text)
+                    sys.stderr.flush()
+                    text = process.stderr.readline().decode("utf-8")
+
+            # Remove existing checkpoint if present.
+            if os.path.exists(os.path.join(args.checkpoint, "checkpoint.img")):
+                os.remove(os.path.join(args.checkpoint, "checkpoint.img"))
+            if os.path.exists(os.path.join(args.checkpoint, "checkpoint.json")):
+                os.remove(os.path.join(args.checkpoint, "checkpoint.json"))
+            # Make the directory, so we will later have the right to delete the checkpoint if
+            # we wish to replace it. Otherwise there is a muddle around permissions.
+            if not os.path.exists(args.checkpoint):
+                os.makedirs(args.checkpoint)
+            # Go ahead and run the runsc checkpoint command.
+            # This is destructive, it will kill the sandbox we are checkpointing.
+            command = make_command(
+                root, ["checkpoint", "--image-path=" + args.checkpoint]
+            )
+            result = subprocess.run(command, cwd=root)  # pylint: disable=no-member
+            if result.returncode != 0:
+                raise Exception(
+                    "gvisor runsc checkpointing problem: " + json.dumps(command)
+                )
+            # Save the configuration of the checkpoint for easy reference.
+            with open(config_filename, "r", encoding="utf-8") as fin:
+                with open(
+                    os.path.join(args.checkpoint, "checkpoint.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as fout:
+                    spec = json.load(fin)
+                    json.dump(spec, fout, indent=2)
+            # We are done!
